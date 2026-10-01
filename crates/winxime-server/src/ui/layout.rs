@@ -1,4 +1,4 @@
-//! 候选栏/字根提示的布局测量：用 DirectWrite 量取文本尺寸，产出 RenderedMetrics。
+﻿//! 候选栏/字根提示的布局测量：用 DirectWrite 量取文本尺寸，产出 RenderedMetrics。
 
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory1, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -7,14 +7,14 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows_core::{w, HSTRING};
 
 use super::model::{CandidateModel, RenderedMetrics, RootModel};
-use super::panel::{panel_extra_height, MENU_BUTTON_GAP, MENU_BUTTON_SIZE, PANEL_MIN_WIDTH};
+use super::panel::{panel_extra_height, PanelPage, MENU_BUTTON_GAP, MENU_BUTTON_SIZE, PANEL_MIN_WIDTH};
 use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
 
     pub(crate) fn calculate_client_rect(
         dwrite: &IDWriteFactory1,
         model: &CandidateModel,
         dpi: f32,
-        panel_visible: bool,
+        panel_page: Option<PanelPage>,
     ) -> Result<RenderedMetrics, String> {
         unsafe {
             let scale = dpi / 96.0;
@@ -143,17 +143,14 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
             let bar_height = rows * item_height + (rows - 1.0) * ROW_SPACING + 2.0 * MARGIN;
 
             // 面板仅在横向布局且有候选时展开（与 macOS 一致，竖排无菜单按钮入口）。
-            let panel = panel_visible && model.horizontal;
-            let width = if panel {
+            // 面板高度按页面取（「剪切板」子页比菜单页高）。
+            let panel_height = panel_page.filter(|_| model.horizontal).map(panel_extra_height);
+            let width = if panel_height.is_some() {
                 max_row_width.max(PANEL_MIN_WIDTH)
             } else {
                 max_row_width
             };
-            let height = if panel {
-                bar_height + panel_extra_height()
-            } else {
-                bar_height
-            };
+            let height = bar_height + panel_height.unwrap_or(0.0);
 
             let hw_width = ((width + BLUR_RADIUS * 2.0) * scale).ceil();
             let hw_height = ((height + BLUR_RADIUS * 2.0) * scale).ceil();
@@ -240,4 +237,3 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
             })
         }
     }
-

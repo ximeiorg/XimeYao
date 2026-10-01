@@ -83,6 +83,13 @@ impl PluginHost {
         host
     }
 
+    /// rime 用户数据目录（单目录模型）。IPC 处理器里做方案词表 / 快捷短语的
+    /// 文件读写用它拿目录——**不要**各自重算路径**：debug 构建里引擎用的是
+    /// `target/debug/user-data`，重算会指到 `%APPDATA%` 去（历史上踩过）。
+    pub fn rime_dir(&self) -> &Path {
+        &self.rime_dir
+    }
+
     /// 扫描已启用插件，缓存元数据（目录 / 入口 / 配置文件路径）。
     fn scan_enabled(&self) {
         let mut list = self.enabled.lock().unwrap_or_else(|e| e.into_inner());

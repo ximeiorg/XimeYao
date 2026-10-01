@@ -50,8 +50,8 @@ use super::layout::{calculate_client_rect, calculate_root_rect};
 use super::model::{CandidateModel, RootModel};
 use super::paint::{on_paint, on_paint_root, on_paint_with_metrics};
 use super::panel::{
-    dispatch_action, menu_item_id, panel_hit, rect_contains, window_to_panel, MenuAction,
-    PanelHit, PanelPage,
+    dispatch_action, menu_item_id, menu_item_label, panel_height, panel_hit, rect_contains,
+    window_to_panel, MenuAction, PanelHit, PanelPage,
 };
 use super::{
     CandidateWindow, BLUR_RADIUS, WM_HIDE_CANDIDATE, WM_HIDE_ROOT, WM_SET_POSITION,
@@ -268,7 +268,7 @@ impl RenderedView {
                         if let Some(view) = view.as_ref() {
                             let dpi = RenderedView::get_dpi_for_window(hwnd);
                             info!("  DPI: {}", dpi);
-                            if let Ok(metrics) = calculate_client_rect(&view.dwrite_factory, &model, dpi, false) {
+                            if let Ok(metrics) = calculate_client_rect(&view.dwrite_factory, &model, dpi, None) {
                                 (*this_ptr).metrics.replace(Some(metrics.clone()));
                                 info!(
                                     "  metrics.width: {}, metrics.height: {}",
@@ -290,7 +290,15 @@ impl RenderedView {
                                 );
                                 if !model.items.is_empty() {
                                     // 面板已在本次更新开始时收起，按纯候选栏布局绘制。
-                                    let _ = on_paint_with_metrics(view, &model, dpi, &metrics, None);
+                                    let _ = on_paint_with_metrics(
+                                        view,
+                                        &model,
+                                        dpi,
+                                        &metrics,
+                                        None,
+                                        &(*this_ptr).panel_list.borrow(),
+                                        &(*this_ptr).panel_grid.borrow(),
+                                    );
                                 }
                             }
                         }
@@ -356,7 +364,7 @@ impl RenderedView {
                     if let Some(view) = view.as_ref() {
                         let dpi = RenderedView::get_dpi_for_window(hwnd);
                         if let Ok(metrics) =
-                            calculate_client_rect(&view.dwrite_factory, &model, dpi, (*this_ptr).panel_visible.get())
+                            calculate_client_rect(&view.dwrite_factory, &model, dpi, (*this_ptr).panel_layout_page())
                         {
                             let _ = SetWindowPos(
                                 hwnd,
@@ -368,11 +376,16 @@ impl RenderedView {
                                 SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
                             );
                             if !model.items.is_empty() {
-                                let _ = on_paint_with_metrics(view, 
+                                let list = (*this_ptr).panel_list.borrow();
+                                let grid = (*this_ptr).panel_grid.borrow();
+                                let _ = on_paint_with_metrics(
+                                    view,
                                     &model,
                                     dpi,
                                     &metrics,
                                     (*this_ptr).panel_paint_state(),
+                                    &list,
+                                    &grid,
                                 );
                             }
                         }
@@ -392,7 +405,15 @@ impl RenderedView {
                     if !model.items.is_empty() {
                         let view = (*this_ptr).view.borrow();
                         if let Some(view) = view.as_ref() {
-                            let _ = on_paint(view, &model, (*this_ptr).panel_paint_state());
+                            let list = (*this_ptr).panel_list.borrow();
+                            let grid = (*this_ptr).panel_grid.borrow();
+                            let _ = on_paint(
+                                view,
+                                &model,
+                                (*this_ptr).panel_paint_state(),
+                                &list,
+                                &grid,
+                            );
                         }
                     }
                 }
@@ -413,7 +434,7 @@ impl RenderedView {
                             if let Ok(metrics) = calculate_client_rect(&view.dwrite_factory, 
                                 &model,
                                 dpi,
-                                (*this_ptr).panel_visible.get(),
+                                (*this_ptr).panel_layout_page(),
                             ) {
                                 pos.cx = metrics.hw_width as i32;
                                 pos.cy = metrics.hw_height as i32;
@@ -435,13 +456,18 @@ impl RenderedView {
                     let pt_x = (lparam.0 & 0xFFFF) as u16 as i16 as f32 / scale;
                     let pt_y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / scale;
 
-                    // 面板区域点击：菜单卡片导航 / 返回菜单 / 触发动作。
-                    let (panel_width, bar_height) = panel_metrics(this);
+                    // 面板区域点击：菜单卡片导航 / 返回菜单 / 触发动作 / 剪切板条目复制。
+                    let (panel_width, bar_height, panel_height) = panel_metrics(this);
                     if let Some((lx, ly)) =
-                        window_to_panel(BLUR_RADIUS, bar_height, panel_width, pt_x, pt_y)
+                        window_to_panel(BLUR_RADIUS, bar_height, panel_width, panel_height, pt_x, pt_y)
                     {
                         let page = this.panel_page.get();
-                        match panel_hit(page, panel_width, lx, ly) {
+                        let hit = {
+                            let list = this.panel_list.borrow();
+                            let grid = this.panel_grid.borrow();
+                            panel_hit(page, panel_width, &list, &grid, lx, ly)
+                        };
+                        match hit {
                             Some(PanelHit::MenuItem(i)) => {
                                 let clicked_id = menu_item_id(i, panel_width);
                                 if clicked_id == Some("settings") {
@@ -452,14 +478,128 @@ impl RenderedView {
                                 } else if let Some(next) = clicked_id.and_then(PanelPage::from_id)
                                 {
                                     this.panel_page.set(next);
-                                    this.hovered_menu.set(None);
+                                    this.hovered_item.set(None);
+                                    if next.is_list_page() {
+                                        // 进入列表子页（剪切板 / 快捷发送）：读一次
+                                        // clipboard.db（UI 线程内一次查询，之后绘制只读内存）。
+                                        this.reload_panel_list(next);
+                                    } else if next.is_grid_page() {
+                                        // 进入网格子页（表情 / 符号）：标签回到「最近使用」、
+                                        // 页码回到第一页，并读一次 recent_usage.json。
+                                        this.reload_panel_grid(next);
+                                    }
+                                    Self::relayout_and_repaint(this, hwnd);
+                                } else if let Some(label) = menu_item_label(i, panel_width) {
+                                    // 既没有子页也没有动作的卡片：现在 6 张卡片都能落到
+                                    // 「开子页」或「设置」上，这里是给以后新增卡片的兜底——
+                                    // 给一句明确反馈并收起面板，不做「点了没反应」的死卡片。
+                                    crate::toast::show_toast(
+                                        "曦码·曜输入法",
+                                        &format!("「{label}」功能暂未开放"),
+                                    );
+                                    this.collapse_panel();
                                     Self::relayout_and_repaint(this, hwnd);
                                 }
                             }
                             Some(PanelHit::Back) => {
                                 this.panel_page.set(PanelPage::Menu);
-                                this.hovered_menu.set(None);
+                                this.hovered_item.set(None);
                                 Self::relayout_and_repaint(this, hwnd);
+                            }
+                            Some(PanelHit::ListItem(row)) => {
+                                let item = this.panel_list.borrow().item_at(row).cloned();
+                                if let Some(item) = item {
+                                    let text = item.text;
+                                    // 1) 剪切板条目先放回系统剪贴板（它本来就是剪贴板内容，
+                                    //    也顺带留一条 Ctrl+V 兜底路径）；快捷发送条目不污染
+                                    //    剪贴板，只有上屏失败时才退化成复制。
+                                    let mut copied = false;
+                                    if this.panel_page.get() == PanelPage::Clipboard {
+                                        copied = crate::clipboard::write_text(&text);
+                                    }
+                                    // 2) 直接上屏：server 自己注入一个触发键，宿主 TSF
+                                    //    照常把它上报回来，server 再把文本当 commit 回包，
+                                    //    文本于是经宿主正常的编辑会话落到光标处。
+                                    let committed = crate::paste::request_commit(&text);
+                                    if !committed && !copied {
+                                        copied = crate::clipboard::write_text(&text);
+                                    }
+                                    this.collapse_panel();
+                                    Self::relayout_and_repaint(this, hwnd);
+                                    let chars = text.chars().count();
+                                    let body = if committed {
+                                        format!("已上屏（{} 字）", chars)
+                                    } else if copied {
+                                        "已复制到剪贴板，按 Ctrl+V 粘贴".to_string()
+                                    } else {
+                                        "上屏失败：剪贴板被其他程序占用，请重试".to_string()
+                                    };
+                                    crate::toast::show_toast("曦码·曜输入法", &body);
+                                }
+                            }
+                            Some(PanelHit::PrevPage) => {
+                                // 列表子页与网格子页共用底部翻页条：按当前页面翻对应那份数据。
+                                // 注意：翻页结果必须先落到局部变量——`if borrow_mut()...`
+                                // 会把 RefMut 临时值延续到整个 if 体内，重绘时再次借用即 panic。
+                                let turned = if page.is_grid_page() {
+                                    this.panel_grid.borrow_mut().prev_page()
+                                } else {
+                                    this.panel_list.borrow_mut().prev_page()
+                                };
+                                if turned {
+                                    this.hovered_item.set(None);
+                                    Self::relayout_and_repaint(this, hwnd);
+                                }
+                            }
+                            Some(PanelHit::NextPage) => {
+                                let turned = if page.is_grid_page() {
+                                    this.panel_grid.borrow_mut().next_page()
+                                } else {
+                                    this.panel_list.borrow_mut().next_page()
+                                };
+                                if turned {
+                                    this.hovered_item.set(None);
+                                    Self::relayout_and_repaint(this, hwnd);
+                                }
+                            }
+                            Some(PanelHit::GlyphTab(index)) => {
+                                // 切分类标签：页码回到第一页；内置字形表是常量，不用重载。
+                                // hover 清空——格子下标是按当前标签算的，留着会指向别的字形。
+                                this.panel_grid.borrow_mut().select_tab(index);
+                                this.hovered_item.set(None);
+                                Self::relayout_and_repaint(this, hwnd);
+                            }
+                            Some(PanelHit::GlyphCell(index)) => {
+                                // 点字形 = 上屏（与剪切板条目同一条通道：server 注入触发键，
+                                // 宿主把它报回来，server 再把字形当 commit 回包）。
+                                // 「在最近使用标签里点按不重排」——安卓同款语义：那一页
+                                // 保持位置稳定，便于在同一个位置连点同一个字形。
+                                let hit_glyph = this
+                                    .panel_grid
+                                    .borrow()
+                                    .item_at(index)
+                                    .map(str::to_string);
+                                if let Some(glyph) = hit_glyph {
+                                    {
+                                        let mut grid = this.panel_grid.borrow_mut();
+                                        if !grid.is_recent_tab() {
+                                            grid.record_use(&glyph);
+                                        }
+                                    }
+                                    let committed = crate::paste::request_commit(&glyph);
+                                    let copied =
+                                        !committed && crate::clipboard::write_text(&glyph);
+                                    this.collapse_panel();
+                                    Self::relayout_and_repaint(this, hwnd);
+                                    let body = if committed {
+                                        format!("已上屏：{glyph}")
+                                    } else if copied {
+                                        "已复制到剪贴板，按 Ctrl+V 粘贴".to_string()
+                                    } else {
+                                        "上屏失败：剪贴板被其他程序占用，请重试".to_string()
+                                    };
+                                    crate::toast::show_toast("曦码·曜输入法", &body);
+                                }
                             }
                             None => {}
                         }
@@ -476,7 +616,7 @@ impl RenderedView {
                             this.panel_visible.set(!this.panel_visible.get());
                             if this.panel_visible.get() {
                                 this.panel_page.set(PanelPage::Menu);
-                                this.hovered_menu.set(None);
+                                this.hovered_item.set(None);
                             }
                             Self::relayout_and_repaint(this, hwnd);
                             return LRESULT(0);
@@ -497,29 +637,37 @@ impl RenderedView {
                     };
                     let _ = TrackMouseEvent(&mut tme);
 
-                    // 仅菜单页有 hover 反馈（与 macOS 一致）。
-                    if this.panel_visible.get() && this.panel_page.get() == PanelPage::Menu {
+                    // hover 反馈：菜单卡片 / 列表条目行 / 网格格子（其它子页无 hover 元素）。
+                    let page = this.panel_page.get();
+                    let hoverable =
+                        page == PanelPage::Menu || page.is_list_page() || page.is_grid_page();
+                    if this.panel_visible.get() && hoverable {
                         let scale = Self::get_dpi_for_window(hwnd) / 96.0;
                         let pt_x = (lparam.0 & 0xFFFF) as u16 as i16 as f32 / scale;
                         let pt_y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / scale;
-                        let (panel_width, bar_height) = panel_metrics(this);
-                        let hovered_menu = match window_to_panel(
+                        let (panel_width, bar_height, panel_height) = panel_metrics(this);
+                        let hovered_item = match window_to_panel(
                             BLUR_RADIUS,
                             bar_height,
                             panel_width,
+                            panel_height,
                             pt_x,
                             pt_y,
                         ) {
                             Some((lx, ly)) => {
-                                match panel_hit(PanelPage::Menu, panel_width, lx, ly) {
-                                    Some(PanelHit::MenuItem(i)) => Some(i),
+                                let list = this.panel_list.borrow();
+                                let grid = this.panel_grid.borrow();
+                                match panel_hit(page, panel_width, &list, &grid, lx, ly) {
+                                    Some(PanelHit::MenuItem(i))
+                                    | Some(PanelHit::ListItem(i))
+                                    | Some(PanelHit::GlyphCell(i)) => Some(i),
                                     _ => None,
                                 }
                             }
                             None => None,
                         };
-                        if this.hovered_menu.get() != hovered_menu {
-                            this.hovered_menu.set(hovered_menu);
+                        if this.hovered_item.get() != hovered_item {
+                            this.hovered_item.set(hovered_item);
                             Self::relayout_and_repaint(this, hwnd);
                         }
                     }
@@ -530,8 +678,8 @@ impl RenderedView {
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
                     let this = &*this_ptr;
-                    if this.hovered_menu.get().is_some() {
-                        this.hovered_menu.set(None);
+                    if this.hovered_item.get().is_some() {
+                        this.hovered_item.set(None);
                         Self::relayout_and_repaint(this, hwnd);
                     }
                 }
@@ -557,13 +705,23 @@ impl RenderedView {
                             let metrics = this.metrics.borrow();
                             metrics.as_ref().and_then(|m| m.menu_button)
                         };
-                        let (panel_width, bar_height) = panel_metrics(this);
+                        let (panel_width, bar_height, panel_height) = panel_metrics(this);
                         let over_interactive = menu_btn.map_or(false, |rect| {
                             rect_contains(rect, px - BLUR_RADIUS, py - BLUR_RADIUS)
-                        }) || window_to_panel(BLUR_RADIUS, bar_height, panel_width, px, py)
-                            .map_or(false, |(lx, ly)| {
-                                panel_hit(this.panel_page.get(), panel_width, lx, ly).is_some()
-                            });
+                        }) || window_to_panel(
+                            BLUR_RADIUS,
+                            bar_height,
+                            panel_width,
+                            panel_height,
+                            px,
+                            py,
+                        )
+                        .map_or(false, |(lx, ly)| {
+                            let list = this.panel_list.borrow();
+                            let grid = this.panel_grid.borrow();
+                            panel_hit(this.panel_page.get(), panel_width, &list, &grid, lx, ly)
+                            .is_some()
+                        });
                         let cursor = if over_interactive {
                             LoadCursorW(None, IDC_HAND)
                         } else {
@@ -625,7 +783,6 @@ impl RenderedView {
     /// 按当前面板状态重算窗口尺寸、缓存布局结果并重绘。
     /// 供面板展开/收起与 hover 重绘复用（须在 UI 线程调用）。
     unsafe fn relayout_and_repaint(this: &CandidateWindow, hwnd: HWND) {
-        let panel_visible = this.panel_visible.get();
         let model = this.model.borrow();
         let view = this.view.borrow();
         let view = match view.as_ref() {
@@ -633,7 +790,9 @@ impl RenderedView {
             None => return,
         };
         let dpi = Self::get_dpi_for_window(hwnd);
-        if let Ok(metrics) = calculate_client_rect(&view.dwrite_factory, &model, dpi, panel_visible) {
+        if let Ok(metrics) =
+            calculate_client_rect(&view.dwrite_factory, &model, dpi, this.panel_layout_page())
+        {
             *this.metrics.borrow_mut() = Some(metrics.clone());
             let _ = SetWindowPos(
                 hwnd,
@@ -645,19 +804,31 @@ impl RenderedView {
                 SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             );
             if !model.items.is_empty() {
-                let _ = on_paint_with_metrics(view, &model, dpi, &metrics, this.panel_paint_state());
+                let list = this.panel_list.borrow();
+                let grid = this.panel_grid.borrow();
+                let _ = on_paint_with_metrics(
+                    view,
+                    &model,
+                    dpi,
+                    &metrics,
+                    this.panel_paint_state(),
+                    &list,
+                    &grid,
+                );
             }
         }
     }
 }
 
-/// 读取缓存的布局结果中面板命中测试所需的 (面板宽, 候选栏高)。
-/// 无缓存（尚未绘制过候选）时面板宽度为 0，命中测试自然落空。
-fn panel_metrics(this: &CandidateWindow) -> (f32, f32) {
+/// 读取缓存的布局结果中面板命中测试所需的 (面板宽, 候选栏高, 面板高)。
+/// 面板高按当前页面取（「剪切板」子页比菜单页高）；无缓存（尚未绘制过候选）时
+/// 面板宽度为 0，命中测试自然落空。
+fn panel_metrics(this: &CandidateWindow) -> (f32, f32, f32) {
+    let page = this.panel_page.get();
     let metrics = this.metrics.borrow();
     match metrics.as_ref() {
-        Some(m) => (m.width, m.bar_height),
-        None => (0.0, 0.0),
+        Some(m) => (m.width, m.bar_height, panel_height(page)),
+        None => (0.0, 0.0, panel_height(page)),
     }
 }
 

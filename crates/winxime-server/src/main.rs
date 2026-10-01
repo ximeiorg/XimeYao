@@ -3,15 +3,20 @@
 mod clipboard;
 mod config;
 mod context;
+mod custom_phrase;
 mod ipc_server;
 mod models;
+mod paste;
 mod plugins;
+mod recent_usage;
 mod register;
 mod schema_manager;
 mod schema_switches;
 mod toast;
 mod tray;
 mod ui;
+mod user_dict;
+mod schema_dict;
 
 use crate::context::SharedInputContext;
 use std::sync::atomic::AtomicBool;
@@ -406,10 +411,21 @@ fn run_server(
     let window = ui::CandidateWindow::new();
     info!("UI window created");
 
-    // 候选栏菜单面板动作（菜单页点击「设置」）→ 启动设置程序。
+    // 候选栏菜单面板动作（菜单页点击「设置」→ 启动设置程序）。
     ui::panel::set_panel_action_callback(Arc::new(|action| match action {
         ui::panel::MenuAction::OpenSettings => launch_setup(None),
     }));
+
+    // 「剪切板」子页的数据源：与设置程序/剪贴板工作线程同一个 clipboard.db
+    // （rime 用户目录的同级文件）。
+    let clipboard_db = user_data_dir
+        .parent()
+        .map(|dir| dir.join("clipboard.db"))
+        .unwrap_or_else(|| user_data_dir.join("clipboard.db"));
+    ui::panel::set_clipboard_db_path(clipboard_db.clone());
+    // 面板「最近使用」记录（表情 / 符号）：与 clipboard.db 同目录的
+    // recent_usage.json（安卓版存在 SharedPreferences 里，等价的一份 JSON）。
+    recent_usage::set_store_path(clipboard_db.with_file_name("recent_usage.json"));
 
     info!("Creating plugin host...");
     // 插件宿主：内置插件安装（resources/plugins）+ 已启用插件 JS 运行时管理。
@@ -442,12 +458,17 @@ fn run_server(
     info!("Creating tray icon...");
     let on_action = {
         let engine = engine.clone();
+        // 切到英文态时收起候选栏：与 IPC 侧的 ToggleAsciiMode 保持同一行为
+        // （英文态下宿主不再把按键送进来，候选栏留着既没用、也会挡住输入法的
+        // 「已关闭」语义）。托盘与按键两条路做同一件事，就不能只有一条收栏。
+        let window_for_tray = window.clone();
         Arc::new(move |action: tray::TrayAction| match action {
             tray::TrayAction::ToggleAsciiMode => {
                 if let Ok(mut eng) = engine.try_lock() {
                     let current = eng.is_ascii_mode();
                     eng.set_option("ascii_mode", !current);
                     tray::update_tray_icon(!current);
+                    window_for_tray.hide();
                 }
             }
             tray::TrayAction::OpenSettings => launch_setup(None),

@@ -111,6 +111,16 @@ pub enum IpcCommand {
     ExportUserDict,
     /// 词典管理：从文本导入用户词典（data = UserDictFile(dict, path)）。
     ImportUserDict,
+    /// 词典管理：读取用户词典词条用于浏览/搜索（data = UserDictQuery(dict, query)）。
+    ListDictEntries,
+    /// 词典管理：写入一条用户词条（data = UserDictEntry；频率 > 0 新增，< 0 标记删除）。
+    ImportDictEntry,
+    /// 方案词表：只读读取方案码表词条（data = SchemaQuery(schema_id, query)）。
+    ListSchemaEntries,
+    /// 快捷短语：读取某方案的短语表（data = SchemaName(schema_id)）。
+    ListCustomPhrases,
+    /// 快捷短语：整表保存（data = CustomPhraseTable(schema_id, entries)）。
+    SaveCustomPhrases,
     /// 系统通知（toast）：由有 MSIX 包身份的 server 进程弹出
     /// （设置进程直跑无包身份，toast 无从归属）。
     ShowToast,
@@ -153,6 +163,16 @@ pub enum IpcRequestData {
     UserDictPath(String),
     /// 词典管理：用户词典名 + 文本文件路径（ExportUserDict / ImportUserDict）。
     UserDictFile(String, String),
+    /// 词典管理：用户词典名 + 过滤关键词（ListDictEntries，空串即不过滤）。
+    UserDictQuery(String, String),
+    /// 词典管理：用户词典名 + 词 + 编码 + 频率（ImportDictEntry；频率 < 0 即标记删除）。
+    UserDictEntry(String, String, String, i32),
+    /// 方案词表：方案 id + 过滤关键词（ListSchemaEntries，空串即不过滤）。
+    SchemaQuery(String, String),
+    /// 快捷短语：方案 id（ListCustomPhrases）。
+    SchemaName(String),
+    /// 快捷短语：方案 id + 整张短语表（SaveCustomPhrases，覆盖式写入）。
+    CustomPhraseTable(String, Vec<CustomPhraseEntry>),
     /// 系统通知内容（ShowToast）。
     Toast(ToastMessage),
 }
@@ -190,6 +210,12 @@ pub struct IpcResponse {
     pub market_response: Option<SchemaMarketResponse>,
     #[serde(default)]
     pub dict_response: Option<DictResponse>,
+    /// 方案词表读取响应（ListSchemaEntries）。
+    #[serde(default)]
+    pub schema_dict_response: Option<SchemaDictResponse>,
+    /// 快捷短语响应（ListCustomPhrases / SaveCustomPhrases）。
+    #[serde(default)]
+    pub phrase_response: Option<CustomPhraseResponse>,
 }
 
 /// 词典管理响应（对齐 weasel DictManagementDialog 的操作结果）。
@@ -198,12 +224,96 @@ pub struct DictResponse {
     /// 用户词典名列表（ListUserDicts 时填充）。
     #[serde(default)]
     pub dicts: Vec<String>,
-    /// 导出/导入的记录条数（其他命令为 0）。
+    /// 导出/导入的记录条数；ListDictEntries 时为**命中条数**（未受回传上限影响）。
     #[serde(default)]
     pub count: i32,
     /// 快照目录（ListUserDicts 时填充）。
     #[serde(default)]
     pub sync_dir: String,
+    /// 词条列表（ListDictEntries 时填充，最多 `MAX_DICT_ENTRIES` 条）。
+    #[serde(default)]
+    pub entries: Vec<DictEntry>,
+    /// 词条总数（ListDictEntries 时填充，未受关键词过滤与条数上限影响）。
+    #[serde(default)]
+    pub total: i32,
+}
+
+/// 用户词典中的一条词条（词 / 编码 / 频率）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DictEntry {
+    /// 词条文本。
+    pub word: String,
+    /// 编码（五笔码、拼音码等；可能为空）。
+    pub code: String,
+    /// 频率（librime 的 commits，越大越优先）。
+    pub commits: i32,
+}
+
+/// 单次 `ListDictEntries` 最多返回的词条数。
+///
+/// 命名管道单帧上限 1MB（`winxime-server::ipc_server::MAX_BUFFER_SIZE`），
+/// 大词库全量回传会超限；超出部分由设置页提示"用搜索框查找"。
+pub const MAX_DICT_ENTRIES: usize = 500;
+
+/// 方案词表读取响应（ListSchemaEntries）。
+///
+/// 方案词表是**只读**的：码表随方案文件发布，改它属于改方案本身；
+/// 要加自己的词，走用户词典（ImportDictEntry）或快捷短语（SaveCustomPhrases）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SchemaDictResponse {
+    /// 方案主码表名（`<schema_id>.schema.yaml` 里 `dictionary:` 的值）。
+    #[serde(default)]
+    pub dict_name: String,
+    /// 实际读入的码表名（主表在前，import_tables / translator.packs 按读入顺序）。
+    #[serde(default)]
+    pub tables: Vec<String>,
+    /// 方案里声明了但文件不存在的码表名（提示用，不算错误）。
+    #[serde(default)]
+    pub missing: Vec<String>,
+    /// 词条列表（最多 `MAX_DICT_ENTRIES` 条；方案词表没有频率概念，`commits` 恒为 0）。
+    #[serde(default)]
+    pub entries: Vec<DictEntry>,
+    /// 读入的词条总数（不受关键词过滤与条数上限影响）。
+    #[serde(default)]
+    pub total: i32,
+    /// 命中条数（未受回传上限影响）。
+    #[serde(default)]
+    pub matched: i32,
+}
+
+/// 快捷短语的一条（词 / 编码 / 可选权重）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CustomPhraseEntry {
+    /// 短语文本。
+    pub word: String,
+    /// 触发编码。
+    pub code: String,
+    /// 权重（越大越优先）；`None` = 文件里没写这一列（rime 视为默认权重）。
+    #[serde(default)]
+    pub weight: Option<i32>,
+}
+
+/// 快捷短语响应（ListCustomPhrases / SaveCustomPhrases）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomPhraseResponse {
+    /// 解析出的短语表名（`custom_phrase.user_dict`，通常就是 `custom_phrase`）。
+    #[serde(default)]
+    pub dict_name: String,
+    /// 短语表文件名（`<dict_name>.txt`）。
+    #[serde(default)]
+    pub file_name: String,
+    /// 短语表文件是否已存在。
+    #[serde(default)]
+    pub file_exists: bool,
+    /// 方案 custom.yaml 里是否已注入 custom_phrase 翻译器。
+    #[serde(default)]
+    pub patch_applied: bool,
+    /// 本次保存是否**新**注入了翻译器（是 → 需要重新部署才生效）。
+    #[serde(default)]
+    pub patch_added: bool,
+    /// 短语列表（保存成功后回填保存后的整表）。
+    #[serde(default)]
+    pub entries: Vec<CustomPhraseEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

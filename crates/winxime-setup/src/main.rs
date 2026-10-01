@@ -97,6 +97,98 @@ fn main() {
     xime_setup_lib::set_notify_dict_restore(IpcClient::restore_user_dict);
     xime_setup_lib::set_notify_dict_export(IpcClient::export_user_dict);
     xime_setup_lib::set_notify_dict_import(IpcClient::import_user_dict);
+    // 词条浏览：IPC ListDictEntries（server 侧走 librime 导出通道再解析）。
+    xime_setup_lib::set_notify_dict_entries(|dict, query| {
+        IpcClient::list_dict_entries(dict, query).map(|d| {
+            xime_setup_lib::state::DictEntriesResult {
+                total: d.total,
+                matched: d.count,
+                entries: d
+                    .entries
+                    .into_iter()
+                    .map(|e| xime_setup_lib::state::DictEntryRow {
+                        word: e.word,
+                        code: e.code,
+                        commits: e.commits,
+                    })
+                    .collect(),
+            }
+        })
+    });
+    // 写词条（新增/删除标记）：IPC ImportDictEntry（server 销毁会话→导入→重建）。
+    xime_setup_lib::set_notify_dict_entry_write(|dict, word, code, commits| {
+        IpcClient::import_dict_entry(dict, word, code, commits)
+    });
+    // 方案词表只读浏览：IPC ListSchemaEntries（server 解析 .dict.yaml 码表）。
+    xime_setup_lib::set_notify_schema_entries(|schema_id, query| {
+        IpcClient::list_schema_entries(schema_id, query).map(|d| {
+            xime_setup_lib::state::SchemaEntriesResult {
+                dict_name: d.dict_name,
+                tables: d.tables,
+                missing: d.missing,
+                total: d.total,
+                matched: d.matched,
+                entries: d
+                    .entries
+                    .into_iter()
+                    .map(|e| xime_setup_lib::state::DictEntryRow {
+                        word: e.word,
+                        code: e.code,
+                        commits: e.commits,
+                    })
+                    .collect(),
+            }
+        })
+    });
+    // 快捷短语：读表 IPC ListCustomPhrases。
+    xime_setup_lib::set_notify_phrase_list(|schema_id| {
+        IpcClient::list_custom_phrases(schema_id).map(|d| {
+            xime_setup_lib::state::PhraseListResult {
+                dict_name: d.dict_name,
+                file_name: d.file_name,
+                file_exists: d.file_exists,
+                patch_applied: d.patch_applied,
+                entries: d
+                    .entries
+                    .into_iter()
+                    .map(|e| xime_setup_lib::state::CustomPhraseRow {
+                        word: e.word,
+                        code: e.code,
+                        weight: e.weight,
+                    })
+                    .collect(),
+            }
+        })
+    });
+    // 快捷短语：整表覆盖保存 IPC SaveCustomPhrases（server 视需要注入方案 patch）。
+    xime_setup_lib::set_notify_phrase_save(|schema_id, entries| {
+        let ipc_entries: Vec<winxime_ipc::CustomPhraseEntry> = entries
+            .iter()
+            .map(|e| winxime_ipc::CustomPhraseEntry {
+                word: e.word.clone(),
+                code: e.code.clone(),
+                weight: e.weight,
+            })
+            .collect();
+        IpcClient::save_custom_phrases(schema_id, &ipc_entries).map(|d| {
+            xime_setup_lib::state::PhraseSaveResult {
+                dict_name: d.dict_name,
+                file_name: d.file_name,
+                file_exists: d.file_exists,
+                patch_applied: d.patch_applied,
+                patch_added: d.patch_added,
+                entries: d
+                    .entries
+                    .into_iter()
+                    .map(|e| xime_setup_lib::state::CustomPhraseRow {
+                        word: e.word,
+                        code: e.code,
+                        weight: e.weight,
+                    })
+                    .collect(),
+            }
+        })
+    });
     // 部署结果系统通知（WinRT toast；非打包环境静默跳过）。
     xime_setup_lib::set_notify_deploy_toast(toast::show_toast);
 

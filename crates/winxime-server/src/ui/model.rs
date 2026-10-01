@@ -1,4 +1,4 @@
-//! 候选栏数据模型：绘制所需的输入数据（候选/字根/布局结果）。
+﻿//! 候选栏数据模型：绘制所需的输入数据（候选/字根/布局结果）。
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows_core::HSTRING;
@@ -124,6 +124,15 @@ impl From<&Context> for CandidateModel {
             .map(|c| c.str.clone())
             .collect();
 
+        // 选字键固定 1..5（与候选栏绘制一致）。
+        let selkeys: Vec<u16> = vec![
+            '1' as u16,
+            '2' as u16,
+            '3' as u16,
+            '4' as u16,
+            '5' as u16,
+        ];
+
         Self {
             items: ctx
                 .candidates
@@ -132,7 +141,7 @@ impl From<&Context> for CandidateModel {
                 .map(|c| c.str.clone())
                 .collect(),
             comments,
-            selkeys: vec!['1' as u16, '2' as u16, '3' as u16, '4' as u16, '5' as u16],
+            selkeys,
             total_pages: ctx.candidates.total_pages,
             current_page: ctx.candidates.current_page + 1,
             current_sel: ctx.candidates.highlighted as usize,
@@ -155,4 +164,3 @@ impl From<&Context> for CandidateModel {
         }
     }
 }
-

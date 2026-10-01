@@ -161,6 +161,170 @@ fn handle_connection(
     tracing::info!("Client disconnected");
 }
 
+/// 方案词表只读浏览（ListSchemaEntries）：主码表 + import_tables 递归 +
+/// translator.packs，在 server 侧解析（设置进程不该自己猜 rime 目录布局）。
+///
+/// 不碰引擎 → 在引擎锁之外执行（见 process_request 开头的预分发注释）。
+fn handle_list_schema_entries(
+    request: &IpcRequest,
+    plugin_host: &Arc<PluginHost>,
+) -> IpcResponse {
+    let query = match &request.data {
+        winxime_ipc::IpcRequestData::SchemaQuery(schema_id, query) => {
+            Some((schema_id.clone(), query.clone()))
+        }
+        _ => None,
+    };
+    tracing::info!("ListSchemaEntries requested: {:?}", query.as_ref().map(|q| &q.0));
+    let outcome = match query {
+        Some((schema_id, query)) => {
+            crate::schema_dict::read_schema_dict(plugin_host.rime_dir(), &schema_id, &query)
+        }
+        None => Err("缺少方案 id".to_string()),
+    };
+    match outcome {
+        Ok(read) => IpcResponse {
+            success: true,
+            session_id: request.session_id,
+            context: None,
+            status: None,
+            schema_list: None,
+            market_response: None,
+            dict_response: None,
+            schema_dict_response: Some(winxime_ipc::SchemaDictResponse {
+                dict_name: read.dict_name,
+                tables: read.tables,
+                missing: read.missing,
+                entries: read.entries,
+                total: read.total,
+                matched: read.matched,
+            }),
+            phrase_response: None,
+        },
+        Err(reason) => {
+            tracing::error!("读取方案词表失败：{reason}");
+            IpcResponse {
+                success: false,
+                session_id: request.session_id,
+                context: None,
+                status: None,
+                schema_list: None,
+                market_response: None,
+                dict_response: None,
+                schema_dict_response: None,
+                phrase_response: None,
+            }
+        }
+    }
+}
+
+/// 快捷短语表读取（ListCustomPhrases）：词/编码/权重 + 文件与 patch 状态。
+fn handle_list_custom_phrases(
+    request: &IpcRequest,
+    plugin_host: &Arc<PluginHost>,
+) -> IpcResponse {
+    let schema_id = match &request.data {
+        winxime_ipc::IpcRequestData::SchemaName(id) => Some(id.clone()),
+        _ => None,
+    };
+    tracing::info!("ListCustomPhrases requested: {:?}", schema_id.as_deref());
+    let outcome = match schema_id {
+        Some(id) => crate::custom_phrase::read_custom_phrases(plugin_host.rime_dir(), &id),
+        None => Err("缺少方案 id".to_string()),
+    };
+    match outcome {
+        Ok(read) => IpcResponse {
+            success: true,
+            session_id: request.session_id,
+            context: None,
+            status: None,
+            schema_list: None,
+            market_response: None,
+            dict_response: None,
+            schema_dict_response: None,
+            phrase_response: Some(winxime_ipc::CustomPhraseResponse {
+                dict_name: read.dict_name,
+                file_name: read.file_name,
+                file_exists: read.file_exists,
+                patch_applied: read.patch_applied,
+                patch_added: false,
+                entries: read.entries,
+            }),
+        },
+        Err(reason) => {
+            tracing::error!("读取快捷短语失败：{reason}");
+            IpcResponse {
+                success: false,
+                session_id: request.session_id,
+                context: None,
+                status: None,
+                schema_list: None,
+                market_response: None,
+                dict_response: None,
+                schema_dict_response: None,
+                phrase_response: None,
+            }
+        }
+    }
+}
+
+/// 快捷短语整表覆盖保存（SaveCustomPhrases）+ 视需要注入方案 patch。
+///
+/// **不做部署**：patch 首次注入后要重新部署才生效，由设置页提示（或点
+/// 「重新部署」）。
+fn handle_save_custom_phrases(
+    request: &IpcRequest,
+    plugin_host: &Arc<PluginHost>,
+) -> IpcResponse {
+    let table = match &request.data {
+        winxime_ipc::IpcRequestData::CustomPhraseTable(schema_id, entries) => {
+            Some((schema_id.clone(), entries.clone()))
+        }
+        _ => None,
+    };
+    tracing::info!("SaveCustomPhrases requested");
+    let outcome = match table {
+        Some((schema_id, entries)) => {
+            crate::custom_phrase::save_custom_phrases(plugin_host.rime_dir(), &schema_id, &entries)
+        }
+        None => Err("缺少方案 id".to_string()),
+    };
+    match outcome {
+        Ok(saved) => IpcResponse {
+            success: true,
+            session_id: request.session_id,
+            context: None,
+            status: None,
+            schema_list: None,
+            market_response: None,
+            dict_response: None,
+            schema_dict_response: None,
+            phrase_response: Some(winxime_ipc::CustomPhraseResponse {
+                dict_name: saved.dict_name,
+                file_name: saved.file_name,
+                file_exists: saved.file_exists,
+                patch_applied: saved.patch_applied,
+                patch_added: saved.patch_added,
+                entries: saved.entries,
+            }),
+        },
+        Err(reason) => {
+            tracing::error!("保存快捷短语失败：{reason}");
+            IpcResponse {
+                success: false,
+                session_id: request.session_id,
+                context: None,
+                status: None,
+                schema_list: None,
+                market_response: None,
+                dict_response: None,
+                schema_dict_response: None,
+                phrase_response: None,
+            }
+        }
+    }
+}
+
 fn process_request(
     request: &IpcRequest,
     engine: &Arc<std::sync::Mutex<RimeEngine>>,
@@ -171,6 +335,23 @@ fn process_request(
     schema_mgr: &Arc<SchemaManager>,
     plugin_host: &Arc<PluginHost>,
 ) -> IpcResponse {
+    // 不碰引擎的词典文件命令在拿锁之前处理：方案词表首次解析大码表可能要
+    // 几百毫秒（pinyin_simp ~39 万条），持锁做会挡住正在打字的键事件
+    // （引擎 try_lock 失败时键事件直接失败）。这些命令只读/写 rime 目录的
+    // 文件，不需要会话。
+    match request.command {
+        IpcCommand::ListSchemaEntries => {
+            return handle_list_schema_entries(request, plugin_host);
+        }
+        IpcCommand::ListCustomPhrases => {
+            return handle_list_custom_phrases(request, plugin_host);
+        }
+        IpcCommand::SaveCustomPhrases => {
+            return handle_save_custom_phrases(request, plugin_host);
+        }
+        _ => {}
+    }
+
     let mut eng = match engine.try_lock() {
         Ok(g) => g,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -184,6 +365,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             };
         }
     };
@@ -197,6 +380,8 @@ fn process_request(
             schema_list: None,
         market_response: None,
         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
         },
 
         IpcCommand::StartSession => {
@@ -209,6 +394,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -222,6 +409,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -235,6 +424,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -250,10 +441,26 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
         IpcCommand::ProcessKeyEvent => {
+            // 候选栏「剪切板」面板点击后的自注入触发键（见 crate::paste）：
+            // 必须在其他分支之前识别——它不参与 rime 组词，也不受英文态影响。
+            if let IpcRequestData::KeyEvent(key) = &request.data {
+                if key.keycode == crate::paste::XK_PASTE_TRIGGER {
+                    return handle_paste_trigger(
+                        &mut eng,
+                        context,
+                        &window,
+                        request.session_id,
+                        key.modifiers,
+                    );
+                }
+            }
+
             let is_ascii = ascii_mode.load(Ordering::Acquire);
             tracing::info!("Key event, ascii_mode={}", is_ascii);
 
@@ -290,6 +497,8 @@ fn process_request(
                                 schema_list: None,
                             market_response: None,
                             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                             };
                         } else {
                             context.update(|ctx| {
@@ -304,6 +513,8 @@ fn process_request(
                                 schema_list: None,
                             market_response: None,
                             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                             };
                         }
                     } else if key.keycode >= 49 && key.keycode <= 57 {
@@ -331,6 +542,8 @@ fn process_request(
                                 schema_list: None,
                             market_response: None,
                             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                             };
                         } else {
                             return IpcResponse {
@@ -341,6 +554,8 @@ fn process_request(
                                 schema_list: None,
                             market_response: None,
                             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                             };
                         }
                     } else {
@@ -361,6 +576,8 @@ fn process_request(
                         schema_list: None,
                     market_response: None,
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                     };
                 }
             }
@@ -375,6 +592,8 @@ fn process_request(
                     schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 };
             }
 
@@ -416,6 +635,8 @@ fn process_request(
                     schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 };
             } else if !eng.is_composing() {
                 tracing::info!("  -> hide (not composing)");
@@ -431,6 +652,8 @@ fn process_request(
                     schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 };
             } else if let Some(ctx) = &ipc_ctx {
                 tracing::info!("  candies: {:?}", ctx.candidates.candies);
@@ -453,6 +676,8 @@ fn process_request(
                     schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 };
             } else {
                 return IpcResponse {
@@ -463,6 +688,8 @@ fn process_request(
                     schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 };
             }
         }
@@ -487,6 +714,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -503,6 +732,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -569,6 +800,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -582,6 +815,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -595,6 +830,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -613,6 +850,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -628,6 +867,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -642,6 +883,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -663,6 +906,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -681,9 +926,133 @@ fn process_request(
                 dicts,
                 count: 0,
                 sync_dir,
+                entries: Vec::new(),
+                total: 0,
             }),
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
+
+        IpcCommand::ListDictEntries => {
+            // 逐条浏览用户词典：经 librime 导出通道读成文本码表再解析
+            // （librime 没有"读词条"的 C 接口，见 crate::user_dict 模块注释）。
+            let query = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictQuery(dict, query) => {
+                    Some((dict.clone(), query.clone()))
+                }
+                _ => None,
+            };
+            tracing::info!("ListDictEntries requested: {:?}", query.as_ref().map(|q| &q.0));
+            let outcome = match query {
+                Some((dict, query)) => crate::user_dict::read_user_dict(&dict, &query),
+                None => Err("缺少词典名".to_string()),
+            };
+            match outcome {
+                Ok(read) => IpcResponse {
+                    success: true,
+                    session_id: request.session_id,
+                    context: None,
+                    status: None,
+                    schema_list: None,
+                    market_response: None,
+                    dict_response: Some(winxime_ipc::DictResponse {
+                        dicts: Vec::new(),
+                        count: read.matched,
+                        sync_dir: String::new(),
+                        entries: read.entries,
+                        total: read.total,
+                    }),
+                    schema_dict_response: None,
+                    phrase_response: None,
+                },
+                Err(reason) => {
+                    tracing::error!("读取用户词典词条失败：{reason}");
+                    IpcResponse {
+                        success: false,
+                        session_id: request.session_id,
+                        context: None,
+                        status: None,
+                        schema_list: None,
+                        market_response: None,
+                        dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
+                    }
+                }
+            }
+        }
+
+        IpcCommand::ImportDictEntry => {
+            // 写入一条用户词条（频率 > 0 新增、< 0 删除标记）。librime 要求
+            // user dict 在 Backup/Restore/Export/Import 前处于关闭状态——
+            // 销毁会话 → 导入 → 重建会话（RimeEngine::with_user_dict_closed）。
+            // 代价：正在输入的句子会丢；重建后照 FocusOut 的做法清掉残留的
+            // 候选窗与输入上下文，免得宿主对着已不存在的 composition 继续画。
+            let entry = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictEntry(dict, word, code, commits) => {
+                    Some((dict.clone(), word.clone(), code.clone(), *commits))
+                }
+                _ => None,
+            };
+            tracing::info!("ImportDictEntry requested");
+            let outcome = match entry {
+                Some((dict, word, code, commits)) => {
+                    let result = eng.with_user_dict_closed(move || {
+                        crate::user_dict::import_entry(&dict, &word, &code, commits)
+                    });
+                    eng.clear_composition();
+                    window.hide();
+                    context.update(|ctx| {
+                        ctx.suggestion_state = None;
+                    });
+                    result
+                }
+                None => Err("缺少词条参数".to_string()),
+            };
+            match outcome {
+                Ok(count) => IpcResponse {
+                    success: true,
+                    session_id: request.session_id,
+                    context: None,
+                    status: None,
+                    schema_list: None,
+                    market_response: None,
+                    dict_response: Some(winxime_ipc::DictResponse {
+                        dicts: Vec::new(),
+                        count,
+                        sync_dir: String::new(),
+                        entries: Vec::new(),
+                        total: 0,
+                    }),
+                    schema_dict_response: None,
+                    phrase_response: None,
+                },
+                Err(reason) => {
+                    tracing::error!("写入用户词条失败：{reason}");
+                    IpcResponse {
+                        success: false,
+                        session_id: request.session_id,
+                        context: None,
+                        status: None,
+                        schema_list: None,
+                        market_response: None,
+                        dict_response: None,
+                        schema_dict_response: None,
+                        phrase_response: None,
+                    }
+                }
+            }
+        }
+
+        IpcCommand::ListSchemaEntries => {
+            // 不碰引擎的文件命令（见 process_request 开头的预分发注释）。
+            handle_list_schema_entries(request, plugin_host)
+        }
+
+        IpcCommand::ListCustomPhrases => handle_list_custom_phrases(request, plugin_host),
+
+        IpcCommand::SaveCustomPhrases => handle_save_custom_phrases(request, plugin_host),
 
         IpcCommand::BackupUserDict => {
             tracing::info!("BackupUserDict requested");
@@ -707,7 +1076,11 @@ fn process_request(
                 dicts: Vec::new(),
                 count,
                 sync_dir: String::new(),
+                entries: Vec::new(),
+                total: 0,
             }),
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -728,6 +1101,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -753,7 +1128,11 @@ fn process_request(
                 dicts: Vec::new(),
                 count,
                 sync_dir: String::new(),
+                entries: Vec::new(),
+                total: 0,
             }),
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -779,7 +1158,11 @@ fn process_request(
                 dicts: Vec::new(),
                 count,
                 sync_dir: String::new(),
+                entries: Vec::new(),
+                total: 0,
             }),
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -805,6 +1188,8 @@ fn process_request(
                 schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -826,6 +1211,8 @@ fn process_request(
                 schema_list: Some(schema_list),
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -851,6 +1238,8 @@ fn process_request(
                             schema_list: None,
                         market_response: None,
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                         }
                     } else {
                         // 拒绝的原因几乎总是「方案未部署」（build/ 无产物）：选进
@@ -865,6 +1254,8 @@ fn process_request(
                             schema_list: None,
                         market_response: None,
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                         }
                     }
                 }
@@ -876,6 +1267,8 @@ fn process_request(
                     schema_list: None,
                 market_response: None,
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
             }
         }
@@ -913,6 +1306,8 @@ fn process_request(
                             schema_list: None,
                         market_response: None,
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                         }
                     } else {
                         tracing::warn!("  -> no root for key '{}' in schema '{}'", c, schema_id);
@@ -924,6 +1319,8 @@ fn process_request(
                             schema_list: None,
                         market_response: None,
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                         }
                     }
                 }
@@ -937,6 +1334,8 @@ fn process_request(
                         schema_list: None,
                     market_response: None,
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                     }
                 }
             }
@@ -963,6 +1362,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -1003,6 +1404,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -1032,6 +1435,8 @@ fn process_request(
                 schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -1046,6 +1451,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::Index(text)),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
                 Err(e) => IpcResponse {
                     success: false,
@@ -1055,6 +1462,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::Error(e)),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
             }
         }
@@ -1074,6 +1483,8 @@ fn process_request(
                             "无效的请求数据".to_string(),
                         )),
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                     }
                 }
             };
@@ -1094,6 +1505,8 @@ fn process_request(
                         dl.schema_id.clone(),
                     )),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
                 Err(e) => IpcResponse {
                     success: false,
@@ -1103,6 +1516,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::Error(e)),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
             }
         }
@@ -1122,6 +1537,8 @@ fn process_request(
                             "无效的请求数据".to_string(),
                         )),
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                     }
                 }
             };
@@ -1134,6 +1551,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::InstallDone(sid.clone())),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
                 Err(e) => IpcResponse {
                     success: false,
@@ -1143,6 +1562,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::Error(e)),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
             }
         }
@@ -1162,6 +1583,8 @@ fn process_request(
                             "无效的请求数据".to_string(),
                         )),
                         dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                     }
                 }
             };
@@ -1174,6 +1597,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::UninstallDone(sid.clone())),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
                 Err(e) => IpcResponse {
                     success: false,
@@ -1183,6 +1608,8 @@ fn process_request(
                     schema_list: None,
                     market_response: Some(SchemaMarketResponse::Error(e)),
                     dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
                 },
             }
         }
@@ -1198,6 +1625,8 @@ fn process_request(
                 schema_list: None,
                 market_response: Some(SchemaMarketResponse::PackageList(packages)),
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -1212,6 +1641,8 @@ fn process_request(
                 schema_list: None,
                 market_response: Some(SchemaMarketResponse::InstalledList(packages)),
                 dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
             }
         }
 
@@ -1223,6 +1654,8 @@ fn process_request(
             schema_list: None,
             market_response: None,
             dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
         },
     }
 }
@@ -1306,6 +1739,60 @@ mod tests {
             parse_rime_selected_schema("var:\n  previously_selected_schema: '  '\n"),
             None
         );
+    }
+}
+
+/// 处理候选栏面板的「点击上屏」触发键（server 自己 `SendInput` 注入的 VK_F24，
+/// 见 [`crate::paste`]）。
+///
+/// - key down：取走待上屏文本，清掉当前编码串，把文本作为 `commit` 回包——
+///   宿主拿到 commit 会用提交文本替换掉当前 composition 并结束它，于是文本
+///   经正常的 TSF 编辑会话落到光标处（`success: true` 同时让宿主吃掉这个键）。
+/// - key up：照样回 `success: true`（不漏给前台应用），但不带 commit。
+fn handle_paste_trigger(
+    eng: &mut RimeEngine,
+    context: &SharedInputContext,
+    window: &CandidateWindow,
+    session_id: u32,
+    modifiers: i32,
+) -> IpcResponse {
+    let released = modifiers & librime::K_RELEASE_MASK as i32 != 0;
+    let text = if released {
+        None
+    } else {
+        crate::paste::take_pending().filter(|t| !t.is_empty())
+    };
+
+    if let Some(ref body) = text {
+        // 半成品编码串不保留：面板里点一条 = 「这条现在就上屏」，
+        // 留着旧编码串会让它跟着文本一起留在文档里。
+        eng.clear_composition();
+        context.update(|ctx| {
+            ctx.suggestion_state = None;
+            ctx.commit_text = body.clone();
+        });
+        window.hide();
+        tracing::info!("上屏触发键：提交 {} 字", body.chars().count());
+    } else if !released {
+        tracing::warn!("上屏触发键到达，但没有待上屏文本（可能已过期或被上一次取走）");
+    }
+
+    IpcResponse {
+        success: true,
+        session_id,
+        context: Some(winxime_ipc::Context {
+            preedit: winxime_ipc::Text {
+                str: String::new(),
+            },
+            commit: text,
+            candidates: winxime_ipc::CandidateInfo::default(),
+        }),
+        status: Some(get_ipc_status(eng)),
+        schema_list: None,
+        market_response: None,
+        dict_response: None,
+            schema_dict_response: None,
+            phrase_response: None,
     }
 }
 

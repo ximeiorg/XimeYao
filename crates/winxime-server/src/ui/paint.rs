@@ -20,9 +20,9 @@ use windows_numerics::Vector2;
 
 use super::layout::calculate_client_rect;
 use super::model::{CandidateModel, RenderedMetrics, RootModel};
-use super::panel::{draw_menu_button, draw_panel, PanelPage};
+use super::panel::{draw_menu_button, draw_panel, PanelGrid, PanelList};
 use super::view::RenderedView;
-use super::{BLUR_RADIUS, COL_SPACING, MARGIN, ROW_SPACING};
+use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
 
     pub(crate) fn on_paint_root(
         view: &RenderedView,
@@ -224,11 +224,14 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, ROW_SPACING};
     pub(crate) fn on_paint(
         view: &RenderedView,
         model: &CandidateModel,
-        panel: Option<(PanelPage, Option<usize>)>,
+        panel: Option<PanelPaintState>,
+        list: &PanelList,
+        grid: &PanelGrid,
     ) -> Result<(), String> {
         let dpi = RenderedView::get_dpi_for_window(view.hwnd);
-        let metrics = calculate_client_rect(&view.dwrite_factory, model, dpi, panel.is_some())?;
-        on_paint_with_metrics(view, model, dpi, &metrics, panel)
+        let metrics =
+            calculate_client_rect(&view.dwrite_factory, model, dpi, panel.map(|state| state.page))?;
+        on_paint_with_metrics(view, model, dpi, &metrics, panel, list, grid)
     }
 
     pub(crate) fn on_paint_with_metrics(
@@ -236,7 +239,9 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, ROW_SPACING};
         model: &CandidateModel,
         dpi: f32,
         metrics: &RenderedMetrics,
-        panel: Option<(PanelPage, Option<usize>)>,
+        panel: Option<PanelPaintState>,
+        list: &PanelList,
+        grid: &PanelGrid,
     ) -> Result<(), String> {
         unsafe {
             info!(
@@ -468,7 +473,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, ROW_SPACING};
             }
 
             // 面板区：候选栏下方（展开时），与候选区同一窗口、间距分隔。
-            if let Some((page, hovered_menu)) = panel {
+            if let Some(state) = panel {
                 draw_panel(
                     &view.d2d_context,
                     &view.dwrite_factory,
@@ -476,8 +481,9 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, ROW_SPACING};
                     blur_radius,
                     metrics.width,
                     metrics.bar_height,
-                    page,
-                    hovered_menu,
+                    state,
+                    list,
+                    grid,
                 )?;
             }
 

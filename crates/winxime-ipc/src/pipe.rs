@@ -83,13 +83,16 @@ impl IpcClient {
 
         let mut response_buf = Vec::new();
         let mut byte = [0u8; 1];
-        let start_time = Instant::now();
+        // 超时口径是「两条字节之间的静默间隔」，不是「整个响应的总时长」：
+        // 服务端的词典导出 / 同步等操作可能几百毫秒才吐出第一个字节（数据完整、
+        // 只是慢），按总时长判会把慢而正确的响应误判成超时。
+        let mut last_byte_at = Instant::now();
 
         loop {
             if response_buf.len() > MAX_RESPONSE_SIZE {
                 return Err(IpcError::ResponseTooLarge);
             }
-            if start_time.elapsed() > Duration::from_millis(READ_TIMEOUT_MS) {
+            if last_byte_at.elapsed() > Duration::from_millis(READ_TIMEOUT_MS) {
                 return Err(IpcError::Timeout);
             }
             match self.pipe.read(&mut byte) {
@@ -99,6 +102,7 @@ impl IpcClient {
                         break;
                     }
                     response_buf.push(byte[0]);
+                    last_byte_at = Instant::now();
                 }
                 Err(e) => return Err(IpcError::ReadFailed(format!("{:?}", e))),
             }
@@ -290,6 +294,114 @@ impl IpcClient {
             };
             match client.send_request(&request) {
                 Ok(response) => response.dict_response.map(|d| d.count),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 读取用户词典词条（query 为空即不过滤），返回词条列表与总数。
+    ///
+    /// 走 librime levers 的导出通道（`export_user_dict`）落临时文本再解析，
+    /// 因此每次调用都是一次全库扫描：词库很大时应当只在打开页面/改关键词时调。
+    pub fn list_dict_entries(dict: &str, query: &str) -> Option<crate::DictResponse> {
+        if let Ok(mut client) = Self::connect() {
+            let request = crate::IpcRequest {
+                command: crate::IpcCommand::ListDictEntries,
+                session_id: 0,
+                data: crate::IpcRequestData::UserDictQuery(dict.to_string(), query.to_string()),
+            };
+            match client.send_request(&request) {
+                Ok(response) => response.dict_response,
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 写入一条用户词条（频率 > 0 新增；< 0 标记删除/tombstone），返回导入条数。
+    ///
+    /// 服务端会先销毁当前 rime 会话再导入（librime 要求 user dict 关闭后再写），
+    /// 正在输入的句子会被打断——调用方要向用户说明。
+    pub fn import_dict_entry(dict: &str, word: &str, code: &str, commits: i32) -> Option<i32> {
+        if let Ok(mut client) = Self::connect() {
+            let request = crate::IpcRequest {
+                command: crate::IpcCommand::ImportDictEntry,
+                session_id: 0,
+                data: crate::IpcRequestData::UserDictEntry(
+                    dict.to_string(),
+                    word.to_string(),
+                    code.to_string(),
+                    commits,
+                ),
+            };
+            match client.send_request(&request) {
+                Ok(response) => response.dict_response.map(|d| d.count),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 只读读取方案词表词条（query 为空即不过滤）。
+    pub fn list_schema_entries(
+        schema_id: &str,
+        query: &str,
+    ) -> Option<crate::SchemaDictResponse> {
+        if let Ok(mut client) = Self::connect() {
+            let request = crate::IpcRequest {
+                command: crate::IpcCommand::ListSchemaEntries,
+                session_id: 0,
+                data: crate::IpcRequestData::SchemaQuery(
+                    schema_id.to_string(),
+                    query.to_string(),
+                ),
+            };
+            match client.send_request(&request) {
+                Ok(response) => response.schema_dict_response,
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 读取某方案的快捷短语表（词 / 编码 / 权重 + 文件与 patch 状态）。
+    pub fn list_custom_phrases(schema_id: &str) -> Option<crate::CustomPhraseResponse> {
+        if let Ok(mut client) = Self::connect() {
+            let request = crate::IpcRequest {
+                command: crate::IpcCommand::ListCustomPhrases,
+                session_id: 0,
+                data: crate::IpcRequestData::SchemaName(schema_id.to_string()),
+            };
+            match client.send_request(&request) {
+                Ok(response) => response.phrase_response,
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 整表保存某方案的快捷短语（服务端写文件 + 视需要注入方案 patch），覆盖式。
+    pub fn save_custom_phrases(
+        schema_id: &str,
+        entries: &[crate::CustomPhraseEntry],
+    ) -> Option<crate::CustomPhraseResponse> {
+        if let Ok(mut client) = Self::connect() {
+            let request = crate::IpcRequest {
+                command: crate::IpcCommand::SaveCustomPhrases,
+                session_id: 0,
+                data: crate::IpcRequestData::CustomPhraseTable(
+                    schema_id.to_string(),
+                    entries.to_vec(),
+                ),
+            };
+            match client.send_request(&request) {
+                Ok(response) => response.phrase_response,
                 Err(_) => None,
             }
         } else {

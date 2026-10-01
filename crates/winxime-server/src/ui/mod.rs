@@ -1,12 +1,16 @@
 //! 候选栏窗口模块入口：对外只暴露 `CandidateWindow` 与自定义消息常量。
 //!
 //! 内部拆分：`model` 数据模型 / `layout` 布局测量 / `paint` D2D 绘制 /
-//! `view` 窗口与消息处理 / `panel` 菜单面板。
+//! `view` 窗口与消息处理 / `panel` 菜单面板 / `glyph` 网格页
+//! （表情 / 符号共用版式）/ `emoji`、`symbol` 两张内置字形表。
 
+mod emoji;
+mod glyph;
 mod layout;
 pub mod panel;
 mod model;
 mod paint;
+mod symbol;
 mod view;
 
 use std::cell::{Cell, RefCell};
@@ -20,8 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winxime_ipc::Context;
 
 use self::model::{CandidateModel, RenderedMetrics, RootModel};
-use self::panel::PanelPage;
+use self::panel::{PanelGrid, PanelList, PanelPage};
 use self::view::RenderedView;
+use crate::recent_usage;
 
 pub const WM_SHOW_CANDIDATE: u32 = WM_USER + 1;
 pub const WM_HIDE_CANDIDATE: u32 = WM_USER + 2;
@@ -45,30 +50,84 @@ pub struct CandidateWindow {
     pub(crate) panel_visible: Cell<bool>,
     /// 面板当前页面。
     pub(crate) panel_page: Cell<PanelPage>,
-    /// 面板菜单页 hover 的卡片下标。
-    pub(crate) hovered_menu: Cell<Option<usize>>,
-    /// 最近一次布局结果（用于 ⋮ 按钮/面板命中测试）。
+    /// 面板内 hover 的元素下标（菜单页卡片 / 列表子页条目行）。
+    pub(crate) hovered_item: Cell<Option<usize>>,
+    /// 列表子页数据（剪切板 / 快捷发送，进入该页时从 clipboard.db 读一次，
+    /// 绘制只读内存；`PanelList::source` 记录这份数据属于哪个子页）。
+    pub(crate) panel_list: RefCell<PanelList>,
+    /// 网格子页状态（表情 / 符号：当前标签、当前页、最近使用记录；
+    /// 进入该页时读一次 recent_usage.json，绘制只读内存）。
+    pub(crate) panel_grid: RefCell<PanelGrid>,
+    /// 最近一次布局结果（用于 ⋮ 按钮/面板/候选命中测试）。
     pub(crate) metrics: RefCell<Option<RenderedMetrics>>,
+}
+
+/// 面板绘制状态（面板展开时为 Some）：页面 + hover 元素下标。
+///
+/// 两者是同一次绘制的同一份状态，打包传递以免绘制接口的参数越加越长
+/// （网格子页的标签 / 页码 / 最近使用另走 [`PanelGrid`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PanelPaintState {
+    pub(crate) page: PanelPage,
+    /// hover 的元素下标（菜单页卡片 / 列表子页条目行 / 网格子页格子）。
+    pub(crate) hovered_item: Option<usize>,
 }
 
 unsafe impl Send for CandidateWindow {}
 unsafe impl Sync for CandidateWindow {}
 
 impl CandidateWindow {
-    /// 当前面板绘制状态（展开时为 Some((页面, hover 卡片下标))）。
-    pub(crate) fn panel_paint_state(&self) -> Option<(PanelPage, Option<usize>)> {
+    /// 当前面板绘制状态（展开时为 Some：页面 + hover 元素）。
+    pub(crate) fn panel_paint_state(&self) -> Option<PanelPaintState> {
         if self.panel_visible.get() {
-            Some((self.panel_page.get(), self.hovered_menu.get()))
+            Some(PanelPaintState {
+                page: self.panel_page.get(),
+                hovered_item: self.hovered_item.get(),
+            })
         } else {
             None
         }
+    }
+
+    /// 当前面板页面（未展开时为 None）——布局据此决定面板区高度。
+    pub(crate) fn panel_layout_page(&self) -> Option<PanelPage> {
+        self.panel_visible.get().then(|| self.panel_page.get())
     }
 
     /// 收起面板并复位到菜单页（输入新内容/隐藏候选栏时调用）。
     pub(crate) fn collapse_panel(&self) {
         self.panel_visible.set(false);
         self.panel_page.set(PanelPage::Menu);
-        self.hovered_menu.set(None);
+        self.hovered_item.set(None);
+    }
+
+    /// 重载列表子页数据（进入「剪切板」/「快捷发送」时调用一次：UI 线程内一次 SQLite
+    /// 查询，之后绘制只读内存；面板绘制不允许逐帧触盘）。
+    pub(crate) fn reload_panel_list(&self, page: PanelPage) {
+        let items = match page {
+            PanelPage::Clipboard => panel::load_clipboard_items(panel::CLIPBOARD_HISTORY_LIMIT),
+            PanelPage::QuickSend => panel::load_quick_send_items(panel::QUICK_SEND_LIMIT),
+            _ => Vec::new(),
+        };
+        *self.panel_list.borrow_mut() = PanelList {
+            source: page,
+            items,
+            page: 0,
+        };
+    }
+
+    /// 重载网格子页状态（进入「表情」/「符号」时调用一次）：标签回到「最近使用」、
+    /// 页码回到第一页，并读一次该页的最近使用记录（内置字形表是常量，不读盘）。
+    pub(crate) fn reload_panel_grid(&self, page: PanelPage) {
+        let recent = page
+            .grid_kind()
+            .map_or_else(Vec::new, |kind| recent_usage::load(kind.recent_kind()));
+        *self.panel_grid.borrow_mut() = PanelGrid {
+            source: page,
+            tab: 0,
+            page: 0,
+            recent,
+        };
     }
 
     pub fn new() -> Arc<Self> {
@@ -78,7 +137,9 @@ impl CandidateWindow {
             view: RefCell::new(None),
             panel_visible: Cell::new(false),
             panel_page: Cell::new(PanelPage::Menu),
-            hovered_menu: Cell::new(None),
+            hovered_item: Cell::new(None),
+            panel_list: RefCell::new(PanelList::default()),
+            panel_grid: RefCell::new(PanelGrid::default()),
             metrics: RefCell::new(None),
         });
 
