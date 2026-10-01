@@ -1,4 +1,6 @@
 /target
+# CUDA 分包构建目录（onnxruntime.dll 同名，必须和 CPU 分包分开）
+/target-cuda*/
 librime-rs-master
 Cargo.lock
 /*.log

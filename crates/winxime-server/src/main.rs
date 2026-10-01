@@ -12,6 +12,7 @@ mod recent_usage;
 mod register;
 mod schema_manager;
 mod schema_switches;
+mod speech;
 mod toast;
 mod tray;
 mod ui;
@@ -95,6 +96,17 @@ fn main() {
     }
 
     register::ensure_registered();
+
+    // 本地语音识别引擎：工作线程常驻、空闲不占麦克风；模型目录按
+    // `%APPDATA%\Xime\models\<id>`（与安卓同一约定，见 models.rs）。
+    // 启动日志按**设置里选中的**模型打印（不是注册表默认模型）。
+    let speech = speech::init(&user_data_dir);
+    info!(
+        "Speech engine ready: model_id={}, model_ready={}, provider={}",
+        speech.selected_profile().id,
+        speech.model_ready(),
+        speech::provider_label()
+    );
 
     let config = XimeConfig::load();
     let engine = match RimeEngine::new(&shared_data_dir, &user_data_dir, "Xime Yao") {
@@ -594,5 +606,6 @@ fn run_server(
     info!("Message loop exited, cleaning up");
 
     tray::cleanup();
+    speech::SpeechEngine::global_shutdown();
     info!("Server shutdown complete");
 }

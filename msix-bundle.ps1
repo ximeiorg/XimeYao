@@ -2,7 +2,11 @@
     [string]$Version = "",
     [switch]$Sign,
     [switch]$Register,
-    [switch]$InstallUnsigned
+    [switch]$InstallUnsigned,
+    # 二进制来源目录。CUDA 包构建在独立目标目录（target-cuda，见 rebuild.ps1 -Gpu）：
+    # 两种预编译包的 onnxruntime.dll 同名（CPU 16.97MB / CUDA 15.53MB），
+    # 放同一目录会互相覆盖、链错运行库。
+    [string]$TargetDir = "target\release"
 )
 
 $ErrorActionPreference = "Continue"
@@ -54,15 +58,15 @@ New-Item "$packageDir\resources" -ItemType Directory -Force | Out-Null
 
 # 1. Copy binaries
 Write-Host "Step 1: Copying binaries..." -ForegroundColor Yellow
-Copy-Item "target\release\winxime-server.exe" $packageDir
-Copy-Item "target\release\winxime_tsf.dll" $packageDir
-Copy-Item "target\release\winxime-setup.exe" $packageDir
-Copy-Item "target\release\winxime-tsf-register.exe" $packageDir
-$rimeDll = "target\release\rime.dll"
+Copy-Item "$TargetDir\winxime-server.exe" $packageDir
+Copy-Item "$TargetDir\winxime_tsf.dll" $packageDir
+Copy-Item "$TargetDir\winxime-setup.exe" $packageDir
+Copy-Item "$TargetDir\winxime-tsf-register.exe" $packageDir
+$rimeDll = "$TargetDir\rime.dll"
 if (Test-Path $rimeDll) {
     Copy-Item $rimeDll $packageDir
 } else {
-    Write-Warning "rime.dll not found at target\release, copying from libximecore..."
+    Write-Warning "rime.dll not found at $TargetDir, copying from libximecore..."
     $json = (& cargo metadata --format-version 1 2>$null) | ConvertFrom-Json
     $pkg = $json.packages | Where-Object { $_.name -eq 'librime-sys2' }
     if (-not $pkg) { Write-Error "librime-sys2 not found"; exit 1 }
@@ -72,6 +76,31 @@ if (Test-Path $rimeDll) {
     if (-not (Test-Path $srcDll)) { Write-Error "rime.dll not found at $srcDll"; exit 1 }
     Copy-Item $srcDll $rimeDll -Force
     Copy-Item $rimeDll $packageDir
+}
+
+# 1.5. Copy speech (sherpa-onnx) runtime DLLs
+#      winxime-server 的导入表直接引用 sherpa-onnx-c-api.dll（链接期就定下了），
+#      少了它 server 根本起不来；onnxruntime.dll 是它的依赖，
+#      providers_shared 由 onnxruntime 运行时按需加载。
+#      CUDA 分包另外多一个 provider（`onnxruntime_providers_cuda.dll`，
+#      CPU 包的目录里没有，有就带上——同一份脚本管两种包）。
+#      不带 providers_tensorrt：它导入 nvinfer_10/nvonnxparser_10/cudnn64_9，
+#      我们从不请求 TensorRT EP，带上只会多一份装不全的运行库依赖。
+Write-Host "Step 1.5: Copying speech runtime DLLs..." -ForegroundColor Yellow
+$mandatoryDlls = @("sherpa-onnx-c-api.dll", "onnxruntime.dll")
+$optionalDlls = @(
+    "onnxruntime_providers_shared.dll",
+    "sherpa-onnx-cxx-api.dll",
+    "onnxruntime_providers_cuda.dll"
+)
+foreach ($dll in $mandatoryDlls) {
+    $srcDll = "$TargetDir\$dll"
+    if (-not (Test-Path $srcDll)) { Write-Error "语音运行库缺失：$srcDll（sherpa-onnx 没构建成功？）"; exit 1 }
+    Copy-Item $srcDll $packageDir
+}
+foreach ($dll in $optionalDlls) {
+    $srcDll = "$TargetDir\$dll"
+    if (Test-Path $srcDll) { Copy-Item $srcDll $packageDir }
 }
 
 # 2. data/ 不再分发 librime 自带 minimal 示例（librime\data\minimal：

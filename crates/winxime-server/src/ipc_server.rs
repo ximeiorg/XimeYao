@@ -161,6 +161,96 @@ fn handle_connection(
     tracing::info!("Client disconnected");
 }
 
+/// 语音命令（设置页「语音转文本」区）。
+///
+/// 不碰 rime 引擎 → 在引擎锁之外执行；下载只投命令立刻返回（进度靠轮询）。
+/// 响应把语音快照挂在 `status.speech` 上，`IpcResponse` 现有字段一律不动。
+fn handle_speech(request: &IpcRequest) -> IpcResponse {
+    let model_id = match &request.data {
+        winxime_ipc::IpcRequestData::SpeechModel(id) => Some(id.clone()),
+        _ => None,
+    };
+    // 需要模型 id 的三条：缺了就报错，不猜。
+    let with_model = |action: fn(&str) -> Result<(), String>| match model_id.as_deref() {
+        Some(id) => action(id).err(),
+        None => Some("缺少模型 id".to_string()),
+    };
+
+    let error = match request.command {
+        IpcCommand::GetSpeechStatus => None,
+        IpcCommand::SpeechDownload => {
+            with_model(crate::speech::SpeechEngine::global_start_download)
+        }
+        IpcCommand::SpeechDelete => with_model(crate::speech::SpeechEngine::global_delete_model),
+        IpcCommand::SpeechSelect => with_model(crate::speech::SpeechEngine::global_select_model),
+        IpcCommand::SpeechTestStart => {
+            crate::speech::SpeechEngine::global_start_preview();
+            None
+        }
+        // 试听结束走 Stop（会话处于试听模式，不会上屏也不弹通知）。
+        IpcCommand::SpeechTestStop => {
+            crate::speech::SpeechEngine::global_stop();
+            None
+        }
+        _ => None,
+    };
+
+    IpcResponse {
+        success: error.is_none(),
+        session_id: request.session_id,
+        status: Some(winxime_ipc::Status {
+            speech: Some(speech_status(error)),
+            ..Default::default()
+        }),
+        ..IpcResponse::default()
+    }
+}
+
+/// 组装语音状态快照（设置页每 250ms 拉一次）。
+///
+/// 引擎未初始化（服务刚起/初始化失败）时：模型列表为空、`state` 仍报 `idle`、
+/// `provider` 仍给分包说明——设置页据「列表为空 + 拿不到状态」显示「服务未运行」，
+/// 不会把「服务没起来」误报成「模型没下载」。
+fn speech_status(error: Option<String>) -> winxime_ipc::SpeechStatus {
+    use crate::speech::{download, SpeechEngine, SpeechState};
+
+    let snapshot = SpeechEngine::global_snapshot();
+    let profile = SpeechEngine::global_selected_profile();
+    let download_state = download::download_state();
+    winxime_ipc::SpeechStatus {
+        state: match snapshot.state {
+            SpeechState::Idle => "idle",
+            SpeechState::Loading => "loading",
+            SpeechState::Listening => "listening",
+        }
+        .to_string(),
+        model_id: profile.id.clone(),
+        model_name: profile.name.clone(),
+        model_ready: SpeechEngine::global_model_ready(),
+        provider: crate::speech::provider_label(),
+        text: snapshot.partial.clone(),
+        // 本次命令的错误优先，其次是会话错误，最后是模型操作（下载/删除）错误。
+        error: error.or(snapshot.error).or_else(download::last_error),
+        download: download_state.map(|state| winxime_ipc::SpeechDownload {
+            model_id: state.model_id,
+            progress: state.progress,
+        }),
+        models_rev: download::models_rev(),
+        models: SpeechEngine::global_catalog()
+            .into_iter()
+            .map(|entry| winxime_ipc::SpeechModel {
+                id: entry.id,
+                name: entry.name,
+                description: entry.description,
+                size: entry.size,
+                downloaded: entry.downloaded,
+                selected: entry.selected,
+                recommended: entry.recommended,
+            })
+            .collect(),
+    }
+}
+
 /// 方案词表只读浏览（ListSchemaEntries）：主码表 + import_tables 递归 +
 /// translator.packs，在 server 侧解析（设置进程不该自己猜 rime 目录布局）。
 ///
@@ -348,6 +438,18 @@ fn process_request(
         }
         IpcCommand::SaveCustomPhrases => {
             return handle_save_custom_phrases(request, plugin_host);
+        }
+        // 语音命令同样不碰 rime 引擎：语音引擎是独立的全局单例（自己一条工作
+        // 线程 + 一个下载线程），拿 rime 引擎锁只会白白挡住打字。下载更是**不能**
+        // 在这里等（132MB，IPC 客户端 100ms 静默即超时）——只投命令、立刻回状态，
+        // 进度由设置页轮询 GetSpeechStatus 取。
+        IpcCommand::GetSpeechStatus
+        | IpcCommand::SpeechDownload
+        | IpcCommand::SpeechDelete
+        | IpcCommand::SpeechSelect
+        | IpcCommand::SpeechTestStart
+        | IpcCommand::SpeechTestStop => {
+            return handle_speech(request);
         }
         _ => {}
     }
@@ -1740,6 +1842,53 @@ mod tests {
             None
         );
     }
+
+    /// 语音状态装配：测试进程里语音引擎**没初始化**（OnceLock 空），
+    /// 此时也必须给出「结构完整」的快照——设置页据此渲染列表与按钮，
+    /// 返回空列表会让页面显示成「没有模型」而不是「服务未就绪」。
+    #[test]
+    fn speech_status_reports_catalog_even_without_engine() {
+        let status = speech_status(None);
+        assert_eq!(status.state, "idle");
+        assert_eq!(
+            status.model_id,
+            xime_speech::AsrModelRegistry::default_profile().id,
+            "引擎未初始化时按默认模型回答（设置页要能显示名字）"
+        );
+        assert!(status.models_rev >= 0);
+        assert!(
+            !status.provider.is_empty(),
+            "后端说明不能是空串：页面那一行会变成一个空白"
+        );
+        // 模型列表要读盘（数据根在引擎上），引擎没起来时为空——设置页据
+        // 「服务未运行」显示，**不假装有模型可下**（点了只会失败）。
+        assert!(
+            status.models.is_empty(),
+            "引擎未初始化时不该凭空造出模型列表"
+        );
+        assert!(status.download.is_none(), "没有下载在进行");
+    }
+
+    /// 语音命令的错误也要带快照回去（一次往返：错误 + 最新状态）。
+    #[test]
+    fn speech_command_without_model_id_fails_but_carries_status() {
+        let request = winxime_ipc::IpcRequest {
+            command: IpcCommand::SpeechDownload,
+            session_id: 7,
+            data: winxime_ipc::IpcRequestData::None,
+        };
+        let response = handle_speech(&request);
+        assert!(!response.success, "缺模型 id 必须失败");
+        assert_eq!(response.session_id, 7);
+        let speech = response
+            .status
+            .and_then(|status| status.speech)
+            .expect("语音响应必须带快照");
+        assert!(
+            speech.error.is_some(),
+            "拒绝的原因要能显示给用户"
+        );
+    }
 }
 
 /// 处理候选栏面板的「点击上屏」触发键（server 自己 `SendInput` 注入的 VK_F24，
@@ -1799,6 +1948,9 @@ fn handle_paste_trigger(
 fn get_ipc_status(eng: &RimeEngine) -> winxime_ipc::Status {
     let status = eng.get_status();
     winxime_ipc::Status {
+        // 按键热路径：这里**不**填 speech（它要查模型目录），留 None；
+        // 语音快照只在语音命令的响应里带（见 handle_speech）。
+        speech: None,
         composing: eng.is_composing(),
         ascii_mode: status.as_ref().map(|s| s.is_ascii_mode).unwrap_or(false),
         schema_id: status

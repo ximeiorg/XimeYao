@@ -444,4 +444,75 @@ impl IpcClient {
             false
         }
     }
+
+    /// 语音状态（设置页「语音转文本」区每 250ms 拉一次）。
+    ///
+    /// server 没起来 / 管道不通都返回 None，调用方据此显示「服务未运行」，
+    /// 不要把它当成「没有模型」。
+    pub fn speech_status() -> Option<crate::SpeechStatus> {
+        let mut client = Self::connect().ok()?;
+        let request = crate::IpcRequest {
+            command: crate::IpcCommand::GetSpeechStatus,
+            session_id: 0,
+            data: crate::IpcRequestData::None,
+        };
+        match client.send_request(&request) {
+            Ok(response) => response.status.and_then(|status| status.speech),
+            Err(_) => None,
+        }
+    }
+
+    /// 语音模型的写操作（下载 / 删除 / 切换 / 试听起停）。
+    ///
+    /// 返回 `Some(status)` = 命令已被 server 受理（status 里带最新快照，可能含
+    /// 本次操作的错误）；`None` = 管道不通 / 没起来。
+    fn speech_action(
+        command: crate::IpcCommand,
+        data: crate::IpcRequestData,
+    ) -> Option<crate::SpeechStatus> {
+        let mut client = Self::connect().ok()?;
+        let request = crate::IpcRequest {
+            command,
+            session_id: 0,
+            data,
+        };
+        match client.send_request(&request) {
+            Ok(response) => response.status.and_then(|status| status.speech),
+            Err(_) => None,
+        }
+    }
+
+    /// 下载语音模型（异步：进度看 [`IpcClient::speech_status`] 的 `download`）。
+    pub fn speech_download(model_id: &str) -> Option<crate::SpeechStatus> {
+        Self::speech_action(
+            crate::IpcCommand::SpeechDownload,
+            crate::IpcRequestData::SpeechModel(model_id.to_string()),
+        )
+    }
+
+    /// 删除语音模型目录。
+    pub fn speech_delete(model_id: &str) -> Option<crate::SpeechStatus> {
+        Self::speech_action(
+            crate::IpcCommand::SpeechDelete,
+            crate::IpcRequestData::SpeechModel(model_id.to_string()),
+        )
+    }
+
+    /// 切换当前使用的语音模型。
+    pub fn speech_select(model_id: &str) -> Option<crate::SpeechStatus> {
+        Self::speech_action(
+            crate::IpcCommand::SpeechSelect,
+            crate::IpcRequestData::SpeechModel(model_id.to_string()),
+        )
+    }
+
+    /// 开始试听（server 侧开麦克风；结果只回显，不上屏）。
+    pub fn speech_test_start() -> Option<crate::SpeechStatus> {
+        Self::speech_action(crate::IpcCommand::SpeechTestStart, crate::IpcRequestData::None)
+    }
+
+    /// 结束试听。
+    pub fn speech_test_stop() -> Option<crate::SpeechStatus> {
+        Self::speech_action(crate::IpcCommand::SpeechTestStop, crate::IpcRequestData::None)
+    }
 }

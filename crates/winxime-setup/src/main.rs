@@ -191,10 +191,59 @@ fn main() {
     });
     // 部署结果系统通知（WinRT toast；非打包环境静默跳过）。
     xime_setup_lib::set_notify_deploy_toast(toast::show_toast);
+    // 语音转文本（本地离线模型）：状态/下载/删除/切换/试听全部走 server 侧
+    // 语音引擎（xime-speech；麦克风归 server 所有，与候选栏 🎙️ 共用会话）。
+    xime_setup_lib::set_notify_speech_status(|| IpcClient::speech_status().map(to_speech_status));
+    xime_setup_lib::set_notify_speech_download(|model_id| {
+        IpcClient::speech_download(model_id).map(to_speech_status)
+    });
+    xime_setup_lib::set_notify_speech_delete(|model_id| {
+        IpcClient::speech_delete(model_id).map(to_speech_status)
+    });
+    xime_setup_lib::set_notify_speech_select(|model_id| {
+        IpcClient::speech_select(model_id).map(to_speech_status)
+    });
+    xime_setup_lib::set_notify_speech_test_start(|| {
+        IpcClient::speech_test_start().map(to_speech_status)
+    });
+    xime_setup_lib::set_notify_speech_test_stop(|| {
+        IpcClient::speech_test_stop().map(to_speech_status)
+    });
 
     tracing::info!(
         "回调注册完成 +{}ms，进入 iced",
         process_start.elapsed().as_millis()
     );
     let _ = xime_setup_lib::run();
+}
+
+/// IPC 语音状态 → 设置库镜像类型（库不依赖 winxime-ipc，转换放在宿主这边）。
+fn to_speech_status(status: winxime_ipc::SpeechStatus) -> xime_setup_lib::SpeechServerStatus {
+    xime_setup_lib::SpeechServerStatus {
+        state: status.state,
+        model_id: status.model_id,
+        model_name: status.model_name,
+        model_ready: status.model_ready,
+        provider: status.provider,
+        text: status.text,
+        error: status.error,
+        // 库侧不引 winxime-ipc：下载进度拍平成 (模型 id, 进度) 元组。
+        download: status
+            .download
+            .map(|download| (download.model_id, download.progress)),
+        models_rev: status.models_rev,
+        models: status
+            .models
+            .into_iter()
+            .map(|model| xime_setup_lib::SpeechModelEntry {
+                id: model.id,
+                name: model.name,
+                description: model.description,
+                size: model.size,
+                downloaded: model.downloaded,
+                selected: model.selected,
+                recommended: model.recommended,
+            })
+            .collect(),
+    }
 }

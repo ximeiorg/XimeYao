@@ -36,13 +36,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetMessagePos, GetWindowLongPtrW, HTCLIENT, LoadCursorW, RegisterClassW,
-    SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_HAND, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WINDOWPOS, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_WINDOWPOSCHANGING,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    DefWindowProcW, GetMessagePos, GetWindowLongPtrW, HTCLIENT, KillTimer, LoadCursorW,
+    RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW,
+    IDC_HAND, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA,
+    WINDOWPOS, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR,
+    WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_core::{HSTRING, Interface, PCWSTR};
 
@@ -57,10 +57,21 @@ use super::{
     CandidateWindow, BLUR_RADIUS, WM_HIDE_CANDIDATE, WM_HIDE_ROOT, WM_SET_POSITION,
     WM_SHOW_CANDIDATE, WM_SHOW_ROOT, WM_UPDATE_CANDIDATE,
 };
+use crate::speech::{self, SpeechState};
 use winxime_ipc::Context;
 
 /// 鼠标离开窗口（windows crate 中该常量位于未启用的 Win32_UI_Controls feature，按 Win32 定义本地声明）。
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// 语音页轮询定时器：聆听中靠它把 partial 文本刷到面板上。
+/// 只在「停在语音页」时开着（离开页面即 KillTimer），没有 partial 变化就不重绘。
+const VOICE_TIMER_ID: usize = 1;
+/// 语音页轮询间隔：60ms（约 16fps）。
+///
+/// 比原来的 120ms 快一档，是为了**电平条**——8fps 的输入电平看着是台阶。
+/// 代价只有一拍读一次状态快照的锁；静默时快照没变化就 `refresh_voice` 返回
+/// false、不重绘，所以提频不会变成"每拍都重画"。
+const VOICE_TIMER_MS: u32 = 60;
 
 const WINDOW_CLASS: &str = "WinximeCandidateWindow";
 
@@ -243,8 +254,14 @@ impl RenderedView {
                 debug!("WM_HIDE_CANDIDATE received");
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
-                    (*this_ptr).collapse_panel();
-                    (*this_ptr).metrics.replace(None);
+                    let this = &*this_ptr;
+                    // 宿主收起候选栏（切窗口 / 组合结束）时若还停在语音页：
+                    // 关定时器 + 丢弃本次采集（不留没人管的麦克风）。
+                    if this.panel_page.get() == PanelPage::VoiceInput {
+                        Self::leave_voice_page(this, hwnd, true);
+                    }
+                    this.collapse_panel();
+                    this.metrics.replace(None);
                 }
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
@@ -262,6 +279,10 @@ impl RenderedView {
                     if !this_ptr.is_null() {
                         (*this_ptr).model.replace(model.clone());
                         // 输入新内容时收起面板（与 macOS 版候选刷新行为一致）。
+                        // 语音页同理：用户开始打字 = 不要这次听写，丢弃并关定时器。
+                        if (*this_ptr).panel_page.get() == PanelPage::VoiceInput {
+                            Self::leave_voice_page(&*this_ptr, hwnd, true);
+                        }
                         (*this_ptr).collapse_panel();
 
                         let view = (*this_ptr).view.borrow();
@@ -298,6 +319,7 @@ impl RenderedView {
                                         None,
                                         &(*this_ptr).panel_list.borrow(),
                                         &(*this_ptr).panel_grid.borrow(),
+                                        &(*this_ptr).voice.borrow(),
                                     );
                                 }
                             }
@@ -378,6 +400,7 @@ impl RenderedView {
                             if !model.items.is_empty() {
                                 let list = (*this_ptr).panel_list.borrow();
                                 let grid = (*this_ptr).panel_grid.borrow();
+                                let voice = (*this_ptr).voice.borrow();
                                 let _ = on_paint_with_metrics(
                                     view,
                                     &model,
@@ -386,6 +409,7 @@ impl RenderedView {
                                     (*this_ptr).panel_paint_state(),
                                     &list,
                                     &grid,
+                                    &voice,
                                 );
                             }
                         }
@@ -407,12 +431,14 @@ impl RenderedView {
                         if let Some(view) = view.as_ref() {
                             let list = (*this_ptr).panel_list.borrow();
                             let grid = (*this_ptr).panel_grid.borrow();
+                            let voice = (*this_ptr).voice.borrow();
                             let _ = on_paint(
                                 view,
                                 &model,
                                 (*this_ptr).panel_paint_state(),
                                 &list,
                                 &grid,
+                                &voice,
                             );
                         }
                     }
@@ -487,6 +513,9 @@ impl RenderedView {
                                         // 进入网格子页（表情 / 符号）：标签回到「最近使用」、
                                         // 页码回到第一页，并读一次 recent_usage.json。
                                         this.reload_panel_grid(next);
+                                    } else if next == PanelPage::VoiceInput {
+                                        // 进入语音页：查一次模型文件 + 预装载 + 开轮询定时器。
+                                        Self::enter_voice_page(this, hwnd);
                                     }
                                     Self::relayout_and_repaint(this, hwnd);
                                 } else if let Some(label) = menu_item_label(i, panel_width) {
@@ -502,9 +531,22 @@ impl RenderedView {
                                 }
                             }
                             Some(PanelHit::Back) => {
+                                if page == PanelPage::VoiceInput {
+                                    // 从语音页返回：还在采集就丢弃本次（「← 菜单」= 放弃）。
+                                    Self::leave_voice_page(this, hwnd, true);
+                                }
                                 this.panel_page.set(PanelPage::Menu);
                                 this.hovered_item.set(None);
                                 Self::relayout_and_repaint(this, hwnd);
+                            }
+                            Some(PanelHit::VoiceToggle) => {
+                                // 装载中 / 模型没下载时按钮是灰的：点了不该有任何动作
+                                // （否则用户看到的是"闪一下又没反应"）。
+                                if this.voice.borrow().button_enabled() {
+                                    Self::toggle_voice(this, hwnd);
+                                } else {
+                                    tracing::debug!("语音页点击被忽略：当前状态不可开始/结束");
+                                }
                             }
                             Some(PanelHit::ListItem(row)) => {
                                 let item = this.panel_list.borrow().item_at(row).cloned();
@@ -625,6 +667,27 @@ impl RenderedView {
                 }
                 LRESULT(0)
             }
+            WM_TIMER => {
+                // 语音页轮询：聆听中把 partial 文本刷到面板上（没变化就不重绘）。
+                if wparam.0 == VOICE_TIMER_ID {
+                    let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
+                    if !this_ptr.is_null() {
+                        let this = &*this_ptr;
+                        let on_voice_page = this.panel_visible.get()
+                            && this.panel_page.get() == PanelPage::VoiceInput;
+                        if on_voice_page {
+                            if this.refresh_voice(false) {
+                                Self::relayout_and_repaint(this, hwnd);
+                            }
+                        } else {
+                            // 兜底：不在语音页就不该有定时器在跑。
+                            let _ = KillTimer(Some(hwnd), VOICE_TIMER_ID);
+                            this.voice_timer.set(false);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
@@ -637,10 +700,13 @@ impl RenderedView {
                     };
                     let _ = TrackMouseEvent(&mut tme);
 
-                    // hover 反馈：菜单卡片 / 列表条目行 / 网格格子（其它子页无 hover 元素）。
+                    // hover 反馈：菜单卡片 / 列表条目行 / 网格格子 / 语音页主按钮
+                    // （其它子页无 hover 元素）。
                     let page = this.panel_page.get();
-                    let hoverable =
-                        page == PanelPage::Menu || page.is_list_page() || page.is_grid_page();
+                    let hoverable = page == PanelPage::Menu
+                        || page.is_list_page()
+                        || page.is_grid_page()
+                        || page == PanelPage::VoiceInput;
                     if this.panel_visible.get() && hoverable {
                         let scale = Self::get_dpi_for_window(hwnd) / 96.0;
                         let pt_x = (lparam.0 & 0xFFFF) as u16 as i16 as f32 / scale;
@@ -661,6 +727,8 @@ impl RenderedView {
                                     Some(PanelHit::MenuItem(i))
                                     | Some(PanelHit::ListItem(i))
                                     | Some(PanelHit::GlyphCell(i)) => Some(i),
+                                    // 语音页只有一个可点元素：下标固定 0（绘制侧同源）。
+                                    Some(PanelHit::VoiceToggle) => Some(0),
                                     _ => None,
                                 }
                             }
@@ -780,6 +848,53 @@ impl RenderedView {
         }
     }
 
+    /// 进入语音页：查一次模型文件 + 预装载识别器（摊掉 ~3s 装载延迟）+ 开轮询定时器。
+    ///
+    /// 模型没下载时预装载只写一句错误到快照里，不阻塞、不崩。
+    unsafe fn enter_voice_page(this: &CandidateWindow, hwnd: HWND) {
+        this.refresh_voice(true);
+        speech::SpeechEngine::global_warmup();
+        if !this.voice_timer.get()
+            && SetTimer(Some(hwnd), VOICE_TIMER_ID, VOICE_TIMER_MS, None) != 0
+        {
+            this.voice_timer.set(true);
+        }
+        // 预装载立刻把状态置成 Loading 又置回 Idle：刷一遍，让面板显示「正在准备」。
+        this.refresh_voice(false);
+    }
+
+    /// 离开语音页：关轮询定时器；`cancel_if_listening` 为 true 且仍在采集时丢弃本次
+    /// （不让一个没人管的麦克风留在后台）。已发过 Stop 的路径传 false——那条路的
+    /// 收尾由上屏负责。
+    unsafe fn leave_voice_page(this: &CandidateWindow, hwnd: HWND, cancel_if_listening: bool) {
+        if this.voice_timer.get() {
+            let _ = KillTimer(Some(hwnd), VOICE_TIMER_ID);
+            this.voice_timer.set(false);
+        }
+        if cancel_if_listening
+            && speech::SpeechEngine::global_snapshot().state == SpeechState::Listening
+        {
+            speech::SpeechEngine::global_cancel();
+        }
+        this.refresh_voice(false);
+    }
+
+    /// 语音页主按钮：待命 / 装载中 → 开始识别；聆听中 → 结束并上屏。
+    ///
+    /// 「结束并上屏」的收尾（finalize → F24 上屏 → toast）在工作线程里做，
+    /// 面板这边随即收起：上屏后宿主会结束组合，候选栏本就该消失。
+    unsafe fn toggle_voice(this: &CandidateWindow, hwnd: HWND) {
+        if this.voice.borrow().state == SpeechState::Listening {
+            speech::SpeechEngine::global_stop();
+            this.collapse_panel();
+            Self::leave_voice_page(this, hwnd, false);
+        } else {
+            speech::SpeechEngine::global_start();
+            this.refresh_voice(false);
+        }
+        Self::relayout_and_repaint(this, hwnd);
+    }
+
     /// 按当前面板状态重算窗口尺寸、缓存布局结果并重绘。
     /// 供面板展开/收起与 hover 重绘复用（须在 UI 线程调用）。
     unsafe fn relayout_and_repaint(this: &CandidateWindow, hwnd: HWND) {
@@ -806,6 +921,7 @@ impl RenderedView {
             if !model.items.is_empty() {
                 let list = this.panel_list.borrow();
                 let grid = this.panel_grid.borrow();
+                let voice = this.voice.borrow();
                 let _ = on_paint_with_metrics(
                     view,
                     &model,
@@ -814,6 +930,7 @@ impl RenderedView {
                     this.panel_paint_state(),
                     &list,
                     &grid,
+                    &voice,
                 );
             }
         }

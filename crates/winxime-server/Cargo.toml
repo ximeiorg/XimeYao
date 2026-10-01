@@ -9,10 +9,18 @@ license.workspace = true
 name = "winxime-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# CUDA 分包：让语音识别链接 CUDA 版 sherpa-onnx 运行库（构建需同时设
+# SHERPA_ONNX_LIB_DIR 指向 CUDA 预编译包 lib 目录，并用独立 target 目录；
+# 见 libximecore crates/xime-speech/Cargo.toml 的说明）。
+speech-cuda = ["xime-speech/cuda"]
+
 [dependencies]
 winxime-ipc = { path = "../winxime-ipc" }
 xime-rime.workspace = true
 xime-plugin.workspace = true
+xime-speech.workspace = true
 xime-config.workspace = true
 librime.workspace = true
 librime-sys2.workspace = true
@@ -36,11 +44,14 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_Audio",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Variant",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",
@@ -56,6 +67,9 @@ ureq = "3.3.0"
 zip = "8.6.0"
 tar = "0.4"
 flate2 = "1"
+# 语音模型包是 .tar.bz2（ModelScope），只需要解压：用纯 Rust 的 bzip2-rs
+# （decode-only），避免再引一个需要 C 编译的 bzip2-sys。
+bzip2-rs = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 anyhow = "1.0"

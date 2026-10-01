@@ -24,6 +24,7 @@ xime-rime = { git = "https://github.com/ximeiorg/libximecore.git", package = "xi
 xime-ipc = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-ipc" }
 xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-setup-lib" }
 xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-plugin" }
+xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-speech" }
 
 # winxime workspace crates
 winxime-tsf = { path = "crates/winxime-tsf" }

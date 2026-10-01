@@ -1848,3 +1848,371 @@ server IPC（设置进程不碰 librime、不猜 rime 目录）；UI 侧沿用 P
 - [ ] **已知边界（如实告知，不算 bug）**：删除词条是 tombstone（复活语义）；快捷短语
   patch 注入后不摘除（清空短语表只清文件内容）；两条写路径都在用户打字时各有代价
   （P2 丢当前句、P4 要手动部署）。
+
+### 2026-10-02 词典页版式重做（用户反馈：功能点摞功能点，不是正常软件的 UI）
+
+- [x] **诊断**：词条/词典/短语全部用 `settings_item`（设置表单行：label 左 + 描述 + 控件
+  右）渲染——编码成了词条下面的小字说明、频率和删除按钮飘在右侧；每本词典是一行四个
+  按钮的表单行；「浏览词条」「快捷短语」各自再套一层页内子视图导航。数据管理页被做成了
+  设置表单 + 三层导航的叠加，这是「一个功能点一层壳」堆出来的形状。
+- [x] **重做（对齐小狼毫词典管理对话框 + 本仓库剪贴板页版式）**，view 全重写、状态机不动：
+  - **页内 Tab**（用户词典 / 快捷短语）：词典列表页与两个子视图导航全部取消，
+    `DictBrowseOpen/DictBrowseClose/DictBrowseRefresh/DictPhraseOpen/DictPhraseClose`
+    五个消息删除，换 `DictTab(usize)` + `DictSelect(String)`；
+    `DictManageState.browse` 从 `Option<DictBrowseState>`（子视图开关）改为常驻字段。
+  - **词典从「每本一行按钮」改为下拉选择**（小狼毫同款）：浏览/备份/导出/导入全部作用于
+    选中词典；词典列表到达且未选中时**自动选第一本**（打开页面即有内容，对齐 P1
+    「不该藏在先点一下后面」的原则）。
+  - **词条区是真正的表格**：列头（词 / 编码 / 频率 / 操作）与数据行同宽定列对齐、斑马纹行、
+    行内小按钮（紧凑 padding）、空态居中卡片内文案；统计 + 翻页合并为页脚一行（左状态
+    右翻页）。快捷短语 Tab 同款表格（短语 / 编码 / 权重 / 操作）。
+  - **整本操作**（备份快照 / 恢复快照… / 导出文本… / 导入文本…）放在工具行下方、
+    **表格上方**（用户反馈：表格 50 行高，操作放表格下面等于埋掉）；任一在途
+    （busy / writing）时四个按钮全部禁用（与词条写的是同一本用户词典，此前在途
+    时点击只是静默无效）；操作结果消息贴操作行显示，语义说明与快照目录沉页尾。
+  - 快捷短语 Tab 进入时自动为当前方案载入（`DictTab(1)` → `phrase_open`）；
+    表文件信息 / 状态行 / 「部署方案」按钮收进同一竖向节奏。
+  - **在途结果按目标丢弃**：词条读取与写词条的结果信箱带上词典名（Entries/EntriesFailed/
+    DictWriteResult 都回显 dict），切下拉期间旧结果不贴到新词典视图上（writing 标志
+    无论哪个词典都复位，避免卡死禁用态）。
+- [x] **测试**：`dict_browse_tests` / `dict_edit_tests` 同步去 Option 化（36 通过），新增
+  `browse_select_resets_state_and_fetches_new_dict`（换词典清关键词/翻页/残留数据 +
+  立刻首读 + 同名重复选择早退）。
+- [x] **验证**：libximecore `cargo build` 0 错、`cargo test -p xime-setup-lib` 36/36；
+  XimeYao `cargo build --quiet` 0 错（警告均为基线）。
+- [ ] **待用户目视验证**（需 `.\rebuild.ps1`）：词典页两个 Tab；用户词典 Tab 词典下拉 +
+  搜索 + 表格（列对齐、斑马纹、行内删除两步确认、页脚统计翻页）+ 表格上方的整本操作行
+  （在途时禁用）+ 操作结果贴行显示；快捷短语 Tab 方案下拉 + 表格 + 底部部署行；两个
+  对话框（新增词条 / 新增短语）遮罩弹窗。
+
+### 2026-10-02 语音转文本技术评估（sherpa-onnx 本地推理 + GPU，实现前定案）
+
+- [x] **评估结论**（网络/源码逐项核实，详案在会话回复）：
+  - **Rust 绑定**：sherpa-onnx 有官方 crate（crates.io `sherpa-onnx` 1.13.8，2026-09-11
+    发布，Apache-2.0，47.8 万下载）；默认静态链接（build.rs 自动下载预编译库），
+    `shared` feature = DLL 随 exe、`SHERPA_ONNX_LIB_DIR` 可控缓存。流式
+    OnlineRecognizer + silero VAD（+以后 SenseVoice/标点）同框架全有 → **不自研解码层**。
+  - **GPU = CUDA**：C API 原生 `provider` 字段（"cpu"/"cuda"/"coreml"，c-api.h 已核对）；
+    官方 Windows CUDA 预编译包（cuda-13.x + cudnn 9.x + onnxruntime 1.28.2，456MB）。
+    **无 DirectML** → 本机 AMD 核显不可用；RTX 4060 Ti（驱动 596.49 = CUDA 13.x 就绪）
+    没问题。int8 流式 zipformer 在 CPU 上本就实时，GPU 收益 = 识别不吃 CPU / 大模型余量。
+  - **多端通用对齐点 = 模型与语义，不是代码**：Android Xime 是 jni 自研 C++ zipformer2
+    （onnxruntime + knf），模型注册表 2 项（ModelScope）：`zipformer-zh-int8`（安卓默认，
+    132MB，纯中文字级无标点）与 `x-asr-480ms-zh-en-punct-int8`（134MB，中英混+自动标点）；
+    语义 accept_pcm16→partial、stop→final、keep-alive。模型即 sherpa 导出格式，Windows
+    用官方库直接吃同一份文件；复刻 Android C++ 解码器 = 数天移植换一个成熟依赖，不值。
+  - **落位**：libximecore 新 crate `xime-speech`（纯推理：SpeechConfig{model_dir,
+    provider, num_threads} + accept_pcm16/partial/finalize/reset + 与安卓同两张表的
+    模型注册表）；winxime-server 承 WASAPI 采集（16k mono）+ worker 线程独占引擎
+    （对齐 PluginRuntime 线程纪律，绝不碰 RimeEngine 锁）；**final 文本走既有
+    paste::request_commit F24 自注入上屏（零 TSF、零 IPC 协议改动）**，partial 走通知条；
+    模型下载 ureq + tar/bzip2（bzip2 crate 需新增）→ `%APPDATA%\Xime\models`（models.rs
+    目录约定已就位）；MSIX microphone capability 已声明。现有 WinRT 语音页保留为
+    「系统后端」，本地模型成为默认后端（设置页经 IPC 驱动 server 会话）。
+  - **风险**：crate 结构体是否透出 provider（P0 验证点，C API 层一定支持）；静态把
+    ~90MB onnxruntime 打进 exe 且 GPU 无法换库 → 选 shared；GPU 包与 MSIX 只读目录
+    （开发流 target\msix-pkg 可写没问题，分发形态后续单独定）。
+- [x] **用户定案（2026-10-02）**：① 默认模型 X-ASR 带标点；② v1 全链路含候选栏
+  🎙️ 直通（final 文本走 F24 自注入上屏）；③ GPU = 可选加速包（CPU 随包默认，
+  `rebuild.ps1 -Gpu` 暂存替换 + 设置切换 provider + 失败回退 CPU）。
+- [x] **P0+P1 完成（libximecore 新 crate `crates/xime-speech`）**：
+  - `registry.rs`：`AsrModelProfile`/`AsrModelRegistry`——与 Android 同两张表
+    （x-asr-480ms-zh-en-punct-int8 默认 + zipformer-zh-int8），未知 id 回退默认
+    文件布局但保留 id 作目录名（对齐 Android `profileOrDefault`）。
+  - `recognizer.rs`：`SpeechProvider(Cpu/Cuda → "cpu"/"cuda")`、`SpeechConfig
+    {num_threads, provider}`、`StreamingRecognizer`（open 校验四文件 →
+    accept_pcm16（sherpa 内部重采样）→ partial_text → finalize/reset →
+    is_endpoint 端点检测；greedy_search + endpoint rule 2.4/1.2/20 显式钉住）。
+  - 链接：sherpa-onnx 1.13.8 官方 crate，**shared 模式**（DLL 随 exe 旁置：
+    onnxruntime.dll 17MB / sherpa-onnx-c-api.dll 4.4MB / providers_shared.dll）。
+  - **环境坑 1（GitHub 下载 TLS 失败）**：sys build.rs 从 GitHub releases 拉
+    预编译库时本机 TLS 握手失败（UnknownIssuer，代理环境）→ 归档用 PowerShell
+    预下载到 `~/.cargo/sherpa-archives`，`libximecore/.cargo/config.toml`
+    [env] SHERPA_ONNX_ARCHIVE_DIR 指过去（该文件已加 .gitignore，CI 走直连不受影响）。
+  - **环境坑 2（System32 DLL 劫持）**：本机 `C:\Windows\System32\onnxruntime.dll`
+    是别家软件放的 1.17.1；cargo test 的测试二进制在 `target\debug\deps\`，
+    其依赖解析先撞 System32（旧版）→ API 版本不匹配 → 访问冲突崩溃。
+    修复：把 4 个 DLL 拷进 `deps\`（exe 目录优先于 System32）。
+    **服务器 exe 不受此坑影响**（DLL 与 exe 同目录 = 搜索顺序第一）。本地
+    `cargo clean` 后重跑测试需再拷一次（一行命令，记录于此）。
+  - **真实模型冒烟已通过**：X-ASR 模型（ModelScope 127.7MB tar.bz2）已手工
+    下载解压到 `%APPDATA%\Xime\models\x-asr-480ms-zh-en-punct-int8\`
+    （encoder.int8 148MB + decoder 10.8MB + joiner 2.5MB + tokens.txt + bpe.model），
+    `open_real_model_when_present` 测试实跑：装载 ~3s + 喂 300ms 静音 + finalize
+    不炸（模型缺席时该测试静默跳过）。**10/10 测试通过**，全 workspace 构建零错误。
+- [x] **GPU 分包改造（2026-10-02 用户定案：编译期 feature 分包，不做运行时换库）**：
+  - xime-speech 新增 `cuda` feature（默认空）：`SpeechProvider::Cuda` 变体
+    `#[cfg(feature = "cuda")]` 门控——CPU 包编译期即无此变体；CUDA 包可运行时
+    选 Cpu（onnxruntime CUDA 版自带 CPU EP）。新增 `cuda_supported()` 自述。
+  - 链接机制：sherpa-onnx-sys 上游只有 static/shared（无 cuda feature）；CUDA
+    分包构建 = `--features cuda` + `SHERPA_ONNX_LIB_DIR` 指向官方 CUDA 预编译包
+    （cuda-13.x + cudnn 9.x + onnxruntime 1.28.2，456MB）解压后的 lib 目录
+    （与 CPU 包同 ABI 同导出符号，build.rs 照常发链接指令 + 拷 DLL）。
+  - **两 flavor 的 onnxruntime.dll 同名 → 必须独立 target 目录**（后构建覆盖
+    先构建的运行库）；CUDA 验证用 `CARGO_TARGET_DIR=target-cuda`，将来
+    `rebuild.ps1 -Gpu` 同款。
+  - CPU 分包验证：10/10 测试 + 构建零错误（feature 关闭时 Cuda 变体不存在的
+    cfg 门由 `provider_strings_match_c_api` 断言钉住）。
+- [x] **CUDA 分包验证（2026-10-01：构建链路已通，运行库缺件已定性）**：
+  - CUDA 预编译包（456MB）下载成功（**`curl --ssl-no-revoke` 才过本机吊销检查**；
+    PowerShell 的 `-Resume` 参数不存在、`Invoke-WebRequest` TLS 失败）→ 解压到
+    `~/.cargo/sherpa-archives/sherpa-onnx-v1.13.8-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda/`，
+    `lib\` = sherpa-onnx-c-api.dll/.lib + cxx-api + onnxruntime.dll(15.5MB) +
+    onnxruntime_providers_cuda.dll(**255MB**) + providers_shared + providers_tensorrt。
+  - **`--features cuda` + `SHERPA_ONNX_LIB_DIR` + 独立 target 目录：链接通过**
+    （libximecore 19.8s 建完 xime-speech；winxime-server `--features speech-cuda`
+    的 `cargo check` 同样过）。
+  - **坑 1：CUDA 包没有 `onnxruntime.lib`**（CPU 包有），而 sys 的 shared 链接固定
+    发 `dylib=onnxruntime`。同 ABI（onnxruntime 1.28.2）下拿 CPU 包的 import lib
+    顶上即可（已拷进 CUDA 包 lib 目录）。P4 打包脚本要么自带一个 import lib，
+    要么 `dumpbin /exports` + `lib /def:` 现生成。
+  - **坑 2（重要）：CUDA EP 缺运行库时直接 abort 进程，不是干净失败**——本机没装
+    CUDA 13 运行库（缺 `cublasLt64_13.dll`，cuDNN 9 也没有），实测
+    `open_real_model_cuda_when_present` 崩在 `STATUS_STACK_BUFFER_OVERRUN
+    (0xc0000409)`：ORT 报 `Error loading onnxruntime_providers_cuda.dll which
+    depends on cublasLt64_13.dll which is missing`，C++ 异常穿过 FFI → Rust 兜不住。
+    含义：**「建会话失败再回退 CPU」在 GPU 缺库时救不了场**，必须建会话**前**先探：
+    server 侧 `cuda_runtime_ready()`（LoadLibrary 探 cublasLt64_13 / cublas64_13 /
+    cudnn64_9，缺则直接用 CPU 并 warn）。→ GPU 包要么自洽带上 CUDA 运行库
+    （cuBLAS/cuDNN ≈ +1GB），要么明确要求用户装 CUDA 13 runtime + cuDNN 9
+    （**P4 决策点**，倾向后者：安装器检测 + 文档要求）。
+  - GPU 真跑一帧（建 CUDA 会话）**本机验证不了**（缺 cuBLAS/cuDNN），留待装了
+    运行库的环境；构建链路本身已验。
+- [x] **P2 服务器宿主（引擎，2026-10-01）**：
+  - `winxime-server/src/speech/mod.rs`：`SpeechEngine`（OnceLock 单例 + mpsc 命令
+    通道 + `SpeechSink` 状态/partial/错误/last_commit 快照）+ `Worker` 线程
+    （MTA COM 初始化 → 命令循环 → warmup 预装载 / start 开会话 / stop 收尾上屏 /
+    cancel 丢弃 / shutdown 退出）；`finish_session`：finalize → 去空白 →
+    `paste::request_commit`（F24 自注入，**零 TSF、零 IPC 协议改动**）→ 剪贴板
+    兜底 → `toast::show_toast`；模型缺失只提示「语音模型未下载」不崩。
+  - `src/speech/capture.rs`：WASAPI 采集（默认通信设备 → IAudioClient 共享模式
+    2s 缓冲 → IAudioCaptureClient 轮询 10ms），混音格式 F32/I16 + 多声道混单声道；
+    24bit/8bit 显式拒绝；SILENT 标志喂零；Drop 里 Stop。
+  - 接线：`main.rs` `mod speech` + 启动 `speech::init(&user_data_dir)` + 退出
+    `SpeechEngine::global_shutdown()`；`Cargo.toml` 加 `speech-cuda` feature（转发
+    `xime-speech/cuda`），windows 依赖补 `Win32_Media_Audio` /
+    `Win32_System_Com_StructuredStorage` / `Win32_System_Variant`
+    （`IMMDevice::Activate` 的 cfg 同时要后两个，少一个方法就不生成）。
+  - 测试：6 个新单测全绿（4 采集混音/格式 + sink 中毒锁 + 模型就绪判定）；全量
+    79 passed / **7 failed = baseline**（models×2、plugins×3、schema_switches×2，
+    都是 `%TEMP%` 受限建目录被拒，非本次引入）。
+- **环境坑 3（cl.exe / lib.exe，只影响受限宿主 shell）**：XimeYao 构建时 MSVC
+  `cl.exe` 报 `D8050 无法执行 c1.dll（未能将命令行放入调试记录）`、`lib.exe` 报
+  `LNK1104` —— 只在 cargo 构建脚本上下文里犯，手动同样命令行通过（libximecore
+  用 cc 1.2.65、XimeYao 锁 cc 1.4.5，且 release 也只在 lzma 归档处犯）。
+  绕法（**只在宿主验证时用，不写进 .cargo/config.toml**，用户管理员 shell 不受影响）：
+  `CC_x86_64_pc_windows_msvc=<llvm>\clang-cl.exe` +
+  `AR_x86_64_pc_windows_msvc=<llvm>\llvm-lib.exe`。
+  另：本环境 Rust 测试进程**不能**在 `%TEMP%` 建目录（baseline 7 个失败的真因），
+  新测试改用仓库 `target/test-tmp/`。
+- [x] **P2 面板 🎙️ 语音页（2026-10-01，UI 接线完成）**：
+  - `ui/panel.rs`：`VoiceView`（语音页缓存：state / model_ready / partial / error /
+    last_commit）——绘制逐帧只读内存，唯一的全局状态读取口是 `VoiceView::refresh`
+    （`check_model` 只在进页时为 true，定时器每拍不查盘）；`PanelHit::VoiceToggle`
+    命中变体（返回按钮优先）；布局 `voice_button_rect`（标题栏下 56 高主按钮）+
+    `voice_text_rect`（按钮下到面板底边距，识别文本折行居中）；绘制 = 卡片
+    + Segoe UI Emoji 画的 🎙️ + 状态文案（聆听中用高亮底色当「正在工作」状态色）。
+  - `ui/view.rs`：`WM_TIMER` 轮询（`VOICE_TIMER_ID` = 1，120ms）——进语音页
+    `enter_voice_page`（查模型 + `global_warmup` 预装载摊掉 ~3s + SetTimer），
+    每拍 `refresh_voice(false)` 有变化才重绘；点主按钮 `toggle_voice`
+    （待命 → start；聆听中 → stop + 收起面板，收尾在上屏侧）；离开页面
+    `leave_voice_page` 关定时器 + **还在采集就 `global_cancel`**（不给用户留一个
+    没人管的麦克风）——「← 菜单」= 放弃、宿主收起候选栏 / 用户开始打字也丢弃。
+    会话外的 Stop/Cancel 在工作线程里是显式忽略的，所以这条兜底不会误伤上屏。
+  - `ui/paint.rs` / `on_paint(_with_metrics)` 多带一份 `&VoiceView`（与
+    `PanelList` / `PanelGrid` 同一套传递方式）。
+  - 测试：面板模块 20 个全绿（新增 3 个：布局落在标题栏与底边距之间 / 命中
+    主按钮与返回按钮、说明行不可点 / 两个文案随状态与模型变化）。
+- [x] **P2 打包暂存（2026-10-01）**：语音运行库必须随包，否则 **server 根本起不来**
+  （`sherpa-onnx-c-api.dll` 在导入表里，链接期就定下了）：
+  - `msix-bundle.ps1` 新增 Step 1.5：必需 `sherpa-onnx-c-api.dll` + `onnxruntime.dll`
+    （缺了直接报错退出，不做「悄悄打出个起不来的包」），可选
+    `onnxruntime_providers_shared.dll` / `sherpa-onnx-cxx-api.dll` /
+    `onnxruntime_providers_cuda.dll` / `onnxruntime_providers_tensorrt.dll`
+    （有就带上——同一份脚本同时管 CPU / CUDA 两种包）。
+  - `crates/winxime-server/wix/main.wxs` 补 4 个 `<Component>`（c-api / cxx-api /
+    onnxruntime / providers_shared）。**CUDA 包还要加 providers_cuda +
+    providers_tensorrt（255MB 那个）→ 留给 P4 加按包型的预处理器开关。**
+  - MSIX `DeviceCapability name="microphone"` 已存在（复核过），无需改。
+- **环境坑 4（编辑工具会吃掉 UTF-8 BOM）**：本仓库的 `.ps1`（`rebuild.ps1` /
+  `msi-build.ps1` / `msix-bundle.ps1`）都带 UTF-8 BOM；用脚本/AI 编辑后若 BOM
+  丢了，**Windows PowerShell 5.1 会按 ANSI 读**，中文注释变乱码 → 整个脚本语法
+  错误（本次 msix-bundle.ps1 中招，已恢复 BOM 并复验 PS 5.1 解析 0 错误）。
+  改完 .ps1 一定核对首三字节是不是 `EF BB BF`。
+- **环境坑 3（cl.exe / lib.exe，只影响受限宿主 shell）**：XimeYao 构建时 MSVC
+  `cl.exe` 报 `D8050 无法执行 c1.dll（未能将命令行放入调试记录）`、`lib.exe` 报
+  `LNK1104` —— 只在 cargo 构建脚本上下文里犯，手动同样命令行通过（libximecore
+  用 cc 1.2.65、XimeYao 锁 cc 1.4.5，且 release 也只在 lzma 归档处犯）。
+  绕法（**只在宿主验证时用，不写进 .cargo/config.toml**，用户管理员 shell 不受影响）：
+  `CC_x86_64_pc_windows_msvc=<llvm>\clang-cl.exe` +
+  `AR_x86_64_pc_windows_msvc=<llvm>\llvm-lib.exe`。
+  另：本环境 Rust 测试进程**不能**在 `%TEMP%` 建目录（baseline 7 个失败的真因），
+  新测试改用仓库 `target/test-tmp/`。baseline 里
+  `plugins::tests::backup_now_uses_typed_plugin_runtime` 是**flaky**的（单跑必失、
+  全量跑有时过 → 全量结果 6 或 7 failed 都属正常，别当回归）。
+### 2026-10-02 语音页产品化重做（用户反馈「不够产品化 / 应该是下拉切换」）
+
+- [x] **页面结构改成「状态大卡 + 下拉 + 详情」**（原来是 5 张 `settings_item`
+  表单卡，模型列表每行一个「使用」按钮）：
+  - **顶部状态大卡**：图标 + 状态徽标（已就绪/模型未下载/装载中/正在听写/
+    服务未运行/读取中）+ 当前模型名 + 后端徽标（CPU / GPU 可用）+ 一句
+    「现在该干什么」，主操作只有一个（试听）。
+  - **语音模型卡**：`pick_list` 下拉选模型（**单值配置用下拉**——与词典页
+    「词典 = 下拉选择，不是每本一行按钮」同一条原则），选中项单独展示
+    描述/大小/工程 id/操作（下载·重新下载·删除）；下载中显示真进度条 + 百分比
+    并按 `busy()` 禁用改模型（正在听写/装载时文件可能被占用）。
+  - **试听结果卡**：识别文本 + 复制（本地文本终于也能复制了，原来只有 WinRT 那块有）。
+  - **系统听写卡**：弱化为「仅本页试听」，明说不参与上屏。
+  - **使用说明卡**：怎么上屏 / 模型文件位置 / GPU 说明 / 隐私（音频不出本机）。
+- [x] **产品化细节**：
+  - 模型**展示名改成人话**（`xime-speech/registry.rs`）：`中英混输（自动标点）`
+    与 `纯中文（不带标点）`，工程 id（`x-asr-480ms-…`）只在下拉详情里以最小字号
+    出现，不再当标题；首个内置模型挂「推荐」徽标（新增 `recommended_id()` +
+    `ModelInfo/SpeechModel/SpeechModelEntry.recommended` 一路透传）。
+  - 状态判断收进 `SpeechStatusKind`（`status_kind()` + `label()` + `hint()` +
+    `is_problem()`）：页面只负责选颜色，文案不再散在 UI 代码里；
+    **区分「还没拉到状态」（读取中）与「管道不通」（服务未运行）**，
+    避免刚进页面闪一下假故障。
+  - `choices()` 的下拉文案 = 名字 · 大小 · 状态（不显示工程 id）。
+  - 新增 `components/widgets.rs`：`progress()`（6px 细进度条，`length/girth`
+    尺寸）与 `pick_list_style()`（下拉框样式与全站 ThemeColors 同源）。
+- [x] **验证**：libximecore `cargo build --quiet` = 0、
+  `cargo test -p xime-setup-lib --features voice-page` **41 passed**（新增 5：
+  状态分类全覆盖 / 每种状态都有文案 / 下拉文案不含工程 id / 选中项与后端标签 /
+  忙时不放改模型）、XimeYao `cargo build --quiet` = 0、server 92 passed / 7 baseline。
+- [ ] 待用户看一眼实际观感（我禁止运行程序）：下拉宽度 360、抬头卡版式、
+  深色/浅色两套主题下的徽标对比度。
+
+### 2026-10-02 候选栏 🎙️ 语音页产品化（用户选定：下一步做这个）
+
+原来是「一个大卡片（🎙️ + 文案）+ 一行灰字」，功能对但不像产品：看不到麦克风
+有没有进声音、状态与操作混在一起、长句全挤在一行居中文本里。重做版式：
+
+- [x] **版式改成四段**（内容区仍是 110px 高，状态行 32 + 电平条 4 + 文本区 58 +
+  提示行 14）：
+  - **状态行**：🎙️ + 状态文字（按状态着色：聆听=主色 / 出错=红 / 不可用=次级 /
+    就绪=正文）+ 右侧**主色胶囊按钮**；**整行都是点击目标**（不用瞄准 116px 按钮），
+    悬停铺一层浅底。
+  - **电平条**：聆听中才画的一条满宽细线（4px，轨道 + 主色填充）——这是这次最
+    值钱的改动：以前对着面板说话，用户不知道麦克风到底有没有收到声音。
+  - **文本区**：识别文本**比候选字大两档**（它才是主角），最多两行左对齐；
+    语义分四档 `VoiceTextKind`（Live 实时 / Committed 已上屏回执 /
+    Placeholder 引导语 / Alert 错误红）。
+  - **提示行**：一行小字 —— 聆听中「说完停顿自动上屏 · Esc 取消」、出错「设置 →
+    语音转文本：下载模型或检查麦克风」、没模型「设置 → 语音转文本：下载模型」、
+    就绪「语音只在本机识别，不出电脑」。
+- [x] **主按钮有"能不能点"的语义**（`button_enabled()`）：装载中与模型未下载时
+  变灰且点击被忽略（`view.rs` 里挡在 `toggle_voice` 之前）——以前点了只会往快照
+  写一句错误，用户看到的是"闪一下没反应"。
+- [x] **输入电平从采集侧来，UI 只读快照**：
+  - `SpeechSink.level: u8`（0~100）。用 `u8` 不用 `f32`：保住 `Eq`（快照靠它判断
+    有没有变化）、天然把重绘压到肉眼可分辨的档位。
+  - `LevelEnvelope`（`speech/mod.rs`）：每块 PCM 算 RMS → `-50dBFS` 以下当静音、
+    `-10dBFS` 满格 → **快起慢落**（涨立刻跟、落按 0.6/块衰减）。包络放在工作线程，
+    面板逐帧仍只读内存（不引入 UI 侧平滑状态，否则 `PartialEq` 每拍都变、
+    静默时也会一直重绘）。
+  - 会话收尾把电平归零，否则面板会停在最后一格音量上，看着像还在听。
+- [x] **轮询间隔 120ms → 60ms**：电平条在 8fps 下是台阶。代价只有每拍读一次快照
+  锁——静默时快照没变化就不重绘（原来那条"没变化不重绘"的纪律原样有效）。
+- [x] **测试**：面板 21 通过（重写 3 条 + 新增「电平只在聆听中画、且参与变化比较」；
+  布局测试改成核对四段的相对关系与底边距）+ speech 16 通过（新增「静音贴地 /
+  说话满格」「快起慢落 + reset」）。XimeYao `cargo build --quiet` = 0，
+  全量 95 passed / 7 baseline。
+- [ ] 待用户实机看（我禁止运行程序）：电平条灵敏度（门限 -50/-10dB 是按常规
+  麦克风定的）、胶囊按钮配色在深浅两套候选配色下是否都清楚。
+- [ ] 顺带没做（可下一轮）：设置页「试听结果」也接这条电平条；面板文本区
+  2 行不够时的滚动/扩展（当前超长文本靠 DWrite 裁切）。
+
+### 2026-10-02 P3 设置页模型管理（下载/切换/删除/试听）+ P4 CUDA 分包接线
+
+- [x] **P3a server 侧模型管理（引擎 + 下载）**：
+  - 选中模型持久化：`%APPDATA%\Xime\speech.toml`（`model_id`）；文件缺失/损坏 →
+    默认模型；**未知 id 保留原样当目录名**（对齐 Android `profileOrDefault`，
+    免得跨端同步来的 id 被悄悄改写）。工作线程每次 warmup / 开会话前
+    `reload_selection()` **现读设置** → 用户在设置里换模型**立刻生效**：
+    零 server 重启、零 IPC、零状态同步代码。
+  - `speech/download.rs`：ureq 流式下载（Content-Length 折算进度：下载 0→0.9、
+    解压 0.9→1.0）→ `bzip2-rs`（纯 Rust 解码）+ `tar` 解包，**只取 `file_name`
+    铺平**到 `models/<id>/`（防目录穿越，且与安卓「一个模型一个目录、四件套平铺」
+    的约定一致）；临时包 `.download.tar.bz2` 成败都删。单飞（同刻只允许一个下载）
+    + **会话进行中拒绝下载**（模型文件可能正被识别器占着，Windows 下写同名文件会失败）。
+  - 下载/错误/模型集合 rev 走全局槽：`models_rev` 让设置页知道「该重查列表了」，
+    而不是每拍都传 132MB 无关信息。
+  - **试听**：新增 `Command::StartPreview`（`preview` 标志）；`finish_session` 在
+    试听模式**不上屏、不弹 toast**，只把最终文本留在快照里——用户在设置页试听，
+    不该往他光标处塞字。
+  - `provider_label()`：只说**分包能力**（CPU 分包 / GPU 优先的 CUDA 分包 +
+    sherpa 版本），实际这一帧用的是哪个看日志，不在设置页假装成运行时事实。
+  - 测试：speech 模块 **14/14 全绿**（新增 8：settings 4 + download 4）。
+- [x] **P3b IPC 面（6 条命令 + 状态载体）**：
+  - `IpcCommand` 加 `GetSpeechStatus` / `SpeechDownload` / `SpeechDelete` /
+    `SpeechSelect` / `SpeechTestStart` / `SpeechTestStop`；`IpcRequestData::SpeechModel(String)`；
+    新类型 `SpeechStatus` / `SpeechDownload` / `SpeechModel`。
+  - **状态挂 `Status.speech: Option<SpeechStatus>`**，不加 `IpcResponse` 第 9 个字段
+    （那有 71 处逐字段字面量，加字段=71 处改动）；按键热路径 `get_ipc_status`
+    显式填 `None`（填它要查模型目录，不能每个键事件都查盘）。
+  - 语音命令放在 `process_request` 的**引擎锁之外**预分发（与方案词表同一理由：
+    别挡住打字）；下载**只投命令、立刻返回**，进度靠轮询——IPC 客户端读超时是
+    「字节静默 >100ms」，132MB 不可能骑在一次阻塞请求上。
+  - 客户端 `winxime-ipc/pipe.rs`：`speech_status()` + `speech_download/delete/
+    select/test_start/test_stop`；`None` = 管道不通 → 页面显示「服务未运行」，
+    与「没有模型」区分开。
+- [x] **P3c 设置页（xime-setup `语音转文本`）**：
+  - 库侧新模块 `speech_models.rs`：镜像类型 + **6 个回调槽**（`set_notify_speech_*`，
+    与既有 17 个 hook 同款 `fn` 指针）+ `SpeechModelState`（status / offline /
+    message / active）。**库不引 `winxime-ipc`**（跨平台库不绑 Windows 命名管道），
+    类型转换放宿主 `winxime-setup/src/main.rs::to_speech_status`。
+  - 轮询纪律：**只有语音页在前台才发 IPC**——`Message::PageSelected` →
+    `pages::voice_page_index()`（按标题反查下标，不写死数字：侧栏分组顺序会变）
+    → `set_active`；250ms 沿用既有 `BackgroundPoll` 订阅。
+  - 页面重排为四组：**本地离线模型**（引擎状态 + provider + 试听 + 识别文本 +
+    提示）/ **语音模型**（每行 名字+大小 / 描述+状态 / 操作：使用·下载(进度%)·
+    重新下载·删除）/ **系统听写（仅本页试听）** / 说明。**两条链路故意不合并**：
+    本地 = server 进程（与候选栏 🎙️ 共用会话），WinRT = 设置进程，各持状态机、
+    各管自己的麦克风，硬凑成「统一引擎」只会互相抢麦。
+  - 文案钉住语义：试听「结果只在本页显示」，上屏用候选栏 🎙️。
+- [x] **P4 CUDA 分包接线（构建/打包脚本）**：
+  - `msi-build.ps1 -Gpu [-SherpaLibDir]`：定位 CUDA 版 sherpa lib 目录（必须含
+    `onnxruntime_providers_cuda.dll`）→ `SHERPA_ONNX_LIB_DIR` +
+    `CARGO_TARGET_DIR=target-cuda` + `--features speech-cuda`；**所有暂存路径改
+    `$TargetDir`**（原来写死 `target\release`，CUDA 包会漏拷 rime.dll/data/
+    user-data/resources 而打出个起不来的包）；candle 加 `-dWithCudaDlls=0/1`；
+    CUDA 包输出名 `ximeyao-<ver>-x86_64-cuda.msi`（两个包同版本号，不混）。
+  - `main.wxs`：`<?ifndef WithCudaDlls ?><?define WithCudaDlls = 0 ?><?endif ?>`
+    默认值——candle **三种传法实测**（不传 / `=1` / `=0`）都 exit 0，CUDA 组件
+    只在 `=1` 时进包。
+  - **`rebuild.ps1` 提权重启丢参数（本轮发现并修）**：非管理员运行时脚本会用
+    `Start-Process -Verb RunAs` 重启自己，但原来 `-ArgumentList` 只传了 `-File`，
+    `-Gpu` / `-SherpaLibDir` **被静默丢掉**——用户以为在验 GPU，实际打的是 CPU 包。
+    已改成按绑定参数拼 `$argList`（`-Gpu` / `-SherpaLibDir` 原样带过去）。
+  - **环境坑 4 复现**：本轮核对发现 `rebuild.ps1` / `msix-bundle.ps1` 都丢了
+    UTF-8 BOM（上一轮编辑留下的），PS 5.1 按 ANSI 读 → 解析报错 4 处 / 1 处；
+    恢复 BOM 后三个 .ps1 全部 0 解析错误。**改完 .ps1 一定要核对首三字节**。
+  - 打包决策：CUDA 包只多带 `onnxruntime_providers_cuda.dll`（255MB）；
+    **不带 cuBLAS/cuDNN（≈1GB）**，要求机器已有 CUDA 13 运行库，缺了
+    `cuda_runtime_ready()` 探针会回退 CPU（这是设计行为，不是失败）；
+    `providers_tensorrt` 不进包（它导 `nvinfer/nvonnxparser/cudnn64_9`，我们不用）。
+- **本轮验证**：XimeYao `cargo build --quiet` = 0；`cargo test -p winxime-server`
+  **92 passed / 7 failed（全 baseline）**；`cargo check -p winxime-server
+  --features speech-cuda --target-dir target-cuda-srv` = 0；libximecore
+  `cargo build --quiet` = 0 且 `cargo build -p xime-setup-lib --features voice-page`
+  = 0；面板模块 20 绿、speech 14 绿、ipc_server 新增 2 绿（状态装配 + 无 id 拒绝）；
+  candle 三种传法 exit 0；三个 .ps1 均 0 解析错误。
+- **待用户真机验证（我做不了）**：装 CUDA 13 运行库后跑 `rebuild.ps1 -Gpu`，看
+  server.log 是否出现「语音识别使用 CUDA（GPU）」；以及设置页语音页的实际观感
+  （本机无 CUDA 13 运行库，探针会回退 CPU）。
+- [x] **下载源连通性已实测（2026-10-02）**：`download_source_is_reachable`
+  （`#[ignore]`，手动跑）对注册表两个模型的 ModelScope URL 真连一次：**TLS 通过、
+  Content-Length 合理、首 3 字节 = `BZh`（确实是 bz2 包，不是重定向错误页）**，
+  0.85s 内两个都过。结论：ureq（rustls）在本机**不需要** curl 那个
+  `--ssl-no-revoke`（那是 Schannel 吊销检查特有的坑），「下载」按钮的传输段可用。
+  真下 132MB 仍未整跑（没必要：连接段过不去在 0.85s 内就暴露了）。
+- [ ] **下一步（P5 收尾）**：① ~~模型下载源在本机 TLS 环境的可用性~~ ✅（已实测
+  ureq 直连可用，见上条）；② 安装器/文档层面的 CUDA 环境检测提示（现在只有日志
+  warn + 设置页说明）；③ 语音页在 4K/窄窗口下的排版复核；④ 用户真机跑一次
+  「下载模型 → 切换 → 试听 → 面板 🎙️ 上屏」全链路（我禁止运行程序，只能到此）。
+- [ ] 分阶段：~~P0 crate 骨架 + 链接打通~~ ✅ → ~~P1 推理封装 + 模型注册表 +
+  真实模型冒烟~~ ✅ → ~~P2 server 采集 + F24 上屏 + 🎙️ 面板接线 + 打包暂存~~ ✅ →
+  ~~P3 设置 UI（模型下载/切换/删除/试听 + provider 显示 + IPC 贯通）~~ ✅ →
+  ~~P4 CUDA 加速包（构建脚本 + MSI 文件清单 + 运行库分发决策）~~ ✅ →
+  P5 收尾（下载源健壮性 + 安装器 CUDA 提示 + 排版复核）。

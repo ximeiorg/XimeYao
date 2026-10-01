@@ -646,3 +646,198 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
 - **快捷短语入口在词典页列表模式加一行**（不是新侧栏项）：短语表是按方案存的
   **用户数据**，归词典页管；入口行标「当前方案：<名>」，子视图里再给 `pick_list`
   换方案（换目标即重读该方案的表）。不做成侧栏项的理由与 P1 相同：词典概念不再拆。
+
+## 2026-10-02 词典页版式重做（数据管理页 ≠ 设置表单）
+
+- **教训：数据管理页不能用 `settings_item` 表单行渲染**。表单行的信息结构是
+  「一个设置项 = label + 描述 + 一个控件」，把它套在「词典列表/词条表/短语表」上，
+  得到的是编码变成小字说明、频率和删除按钮飘在右侧、每本词典一行四个按钮——
+  功能都在，但页面像三张设置表单叠起来。**判断依据**：页面的数据是一对多集合
+  （词条列表）还是单值配置（一个设置项）；集合用表格（列头对齐 + 斑马纹行 +
+  行内操作），单值才用表单行。以后新页面先问这一句。
+- **词典 = 下拉选择，不是「每本词典一行按钮」**（对齐小狼毫词典管理对话框）：
+  浏览/备份/导出/导入都作用于"当前词典"这一个概念，四个按钮 × N 本词典是把这个
+  单概念摊成了 N 行。列表到达且未选中时自动选第一本——空列表状态下拉里连内容
+  都没有，"先选一下"是多余的一步（与 P1「启动即拉词典列表」同一条原则）。
+- **导航层级：能删就删**。原来「词典列表 → 浏览词条子视图 → （另一个入口）短语
+  子视图」三层，两个子视图各带返回按钮和工具行；Tab 化后「用户词典 / 快捷短语」
+  两个 Tab 平铺，`browse` 状态从 `Option`（子视图开关）变成常驻字段——**Tab 页的
+  状态不该跟着导航开关走**，切 Tab 不丢已加载的数据（短语 Tab 离开再回来还在）。
+- **在途结果按目标丢弃（泛化）**：P3/P4 用 schema_id 回显防串台，这次给词条读取
+  和写词条也补上词典名回显（`Entries{dict}` / `DictWriteResult{dict}`）——切下拉
+  的瞬间正在途的读写，结果回来不能贴到新词典的视图上。`writing` 标志例外：无论
+  结果属于哪本词典都要复位，否则旧词典的写入结果会把新词典的按钮永久禁死。
+  规则：**每个后台信箱都携带它写向的目标标识，poll 按标识过滤**。
+- **表格页的操作永远放表格上方**（用户实测反馈：整本操作放表格下面"等于埋掉"）：
+  词条表每页 50 行，任何跟表格平级的操作行放在表格**后**面都沉到两屏之外。顺序
+  固定为：工具行（选择器 + 搜索 + 新增）→ 操作行（备份/恢复/导出/导入）→ 结果
+  消息 → 表格 → 页脚（统计 + 翻页）→ 静态参考信息（语义说明 / 快照目录）。
+  同时补了在途互斥：整本操作与词条写的是**同一本用户词典**（server 侧要引擎），
+  任一在途时按钮全部禁用——此前 busy 时点击只是 `start_backup` 里静默早退，
+  用户看到的是"点了没反应"。
+
+- **表格实现（iced 无 Table 控件）**：列头行与数据行用同一组列宽（首列
+  `Length::Fill`、编码/频率/权重等短内容列 `Fixed` 定宽、操作列定宽右对齐）
+  天然对齐；斑马纹 = 隔行 `surface_variant` 底色的容器（卡片底色 surface 与之
+  一档之差，可见但不吵）；行内按钮复用 `text_button`/`button_danger` 覆盖
+  `padding([4,10])` 压扁。**不做**单侧分隔线（iced Border 是四边同参）与
+  真滚动（外层 scrollable 已有，翻页继续用）。
+
+## 2026-10-02 语音转文本（本地 sherpa-onnx 推理，跨端 crate + GPU 可选包）
+
+- **用 sherpa-onnx 官方 Rust crate，不复刻 Android 的自研 C++ 解码器**：Android Xime
+  在 jni 里手写了 zipformer2 流式解码（onnxruntime + kaldi-native-fbank，为省体积）；
+  Windows 复刻 = 数天移植 + 自背解码正确性，换省一个成熟依赖。sherpa-onnx 有官方
+  crate（1.13.8，与 C 库同步发版）、流式 + VAD + 后续 SenseVoice/标点全在框架内。
+  **跨端通用的对齐点是模型文件与交互语义，不是代码**：Android 注册表里两个模型
+  （ModelScope 的 streaming zipformer tar.bz2）就是 sherpa 导出格式，同一份文件
+  直接吃；语义对齐 `accept_pcm16 → partial、stop → final、keep-alive`。
+- **libximecore 新 crate `xime-speech` 只放纯推理**（配置/识别器封装/模型注册表）：
+  音频采集归宿主（Windows = server 的 WASAPI，Android = AudioRecord），下载归宿主
+  （server 已有 ureq/tar/zip 基建）——core 不碰麦克风、不发网络请求，才配叫跨端核心。
+  识别器归 worker 线程独占（PluginRuntime 同款线程纪律），**绝不碰 RimeEngine 锁**；
+  上屏只在 final 时走 `paste::request_commit`（F24 自注入）既有通道——**零 TSF、
+  零 IPC 协议改动**，partial 走通知条。WinRT SpeechRecognizer 语音页保留为
+  「系统后端」，本地模型设为默认。
+- **默认模型 = X-ASR 中英+标点**（有意与 Android 默认不同，Android 默认
+  zipformer-zh-int8）：IME 听写要的是「直接可用的文本」——带标点、中英混输比
+  纯中文字级无标点省一次人工整理；注册表两个都进（同 Android 两张表），随时可换。
+- **GPU = 编译期 feature 分包（CPU 包 / CUDA 包），不做运行时换库**（2026-10-02
+  用户定案）：xime-speech 暴露 `cuda` feature——CPU 包不启用（`SpeechProvider::Cuda`
+  变体不存在，编译期挡下误用）；CUDA 包启用，并用 `SHERPA_ONNX_LIB_DIR` 指向
+  官方 CUDA 预编译包（cuda-13.x + cudnn 9.x + onnxruntime 1.28.2，456MB，与
+  CPU 包同 ABI 同导出符号）解压后的 lib 目录链接。**两 flavor 的 DLL 同名**
+  （onnxruntime.dll 等），必须用独立 target 目录构建，否则后构建的运行库覆盖
+  先构建的；打包脚本按包型选 target（`rebuild.ps1 -Gpu` 走 target-cuda），CUDA
+  版安装包自带全家桶——原「运行时换 DLL」方案里的 MSIX 只读目录问题就此消失。
+  CUDA 包里 provider 仍可运行时选 Cpu（onnxruntime CUDA 版自带 CPU EP）；
+  反方向（CPU 包选 Cuda）编译期即无此变体。sherpa-onnx 无 DirectML（AMD/Intel
+  核显出局，如实告知用户）；int8 流式 zipformer CPU 本就实时，GPU 收益 =
+  识别不吃 CPU + 大模型余量。
+- **CUDA 包必须自证 CUDA 运行库就绪，再建 GPU 会话**（2026-10-01 实测，见 PROGRESS
+  「CUDA 分包验证」）：onnxruntime 的 CUDA EP 缺 CUDA 运行库时**不是返回错误，
+  而是 abort 进程**（`onnxruntime_providers_cuda.dll` 缺依赖 → C++ 异常穿过 FFI →
+  Rust 兜不住，实测 `STATUS_STACK_BUFFER_OVERRUN`）。所以「建会话失败回退 CPU」
+  这条兜底在缺库场景下**根本不执行**，必须在建会话前探测（`cuda_runtime_ready()`
+  用 LoadLibrary 探 cublasLt64_13 / cublas64_13 / cudnn64_9，缺则直接用 CPU 并 warn）。
+  另外官方 CUDA 预编译包的 lib 目录**没有 `onnxruntime.lib`**（CPU 包有），而
+  sherpa-onnx-sys 的 shared 链接固定发 `dylib=onnxruntime`；同 ABI 下拿 CPU 包的
+  import lib 顶上即可，P4 打包脚本按需现生成（`dumpbin /exports` + `lib /def:`）。
+  CUDA 运行库（cuBLAS/cuDNN ≈ 1GB）**不随包分发**（2026-10-02 定案）：CUDA 包只
+  多带 `onnxruntime_providers_cuda.dll`（255MB），要求机器已装 CUDA 13 运行库；
+  缺了由 `cuda_runtime_ready()` 探针回退 CPU（不是 abort、不是报错）。
+
+## 2026-10-02 语音模型管理：server 持有，设置页只做「镜子 + 按钮」
+
+- **IME 后端只用本地 sherpa-onnx；WinRT 听写降级为「仅设置页试听」，两条链路
+  不合并**。理由不只是「先做哪个」：本地引擎在 **server 进程**（与候选栏 🎙️ 共用
+  一条会话，麦克风所有权唯一），WinRT 在 **设置进程**——同一个 `SettingsState`
+  里塞两个引擎镜像已经很乱，再让设置进程也去抢麦克风，就会出现「面板正在听写 +
+  设置页点了开始听写」两头抢同一设备的局面。所以设置页只用回调**驱动 server 的
+  引擎**（试听也走它），WinRT 那块保持原样并明说「不参与上屏」。
+- **选中模型存 `<数据根>/speech.toml`，server 每次开会话前现读**（不缓存、不发
+  通知）：换模型因此**零 IPC、零重启、零状态同步**——设置页写完文件就完事，
+  server 下次 warmup/开麦时自然读到。文件缺失/损坏 → 默认模型；**未知 id 原样
+  保留**（对齐 Android `profileOrDefault`：跨端同步来的 id 不能被悄悄改写，
+  否则用户永远看不出为什么"切了没变"）。
+- **下载/删除归 server，接口是「异步开始 + 轮询进度」**，不是同步 RPC：IPC 客户端
+  的读超时是「字节静默 >100ms」，132MB 的模型包不可能骑在一次阻塞请求上；而且
+  下载线程不能占识别器工作线程（用户会一边听写一边下模型）。设置页只发「开始」，
+  进度/错误/`models_rev` 从 `GetSpeechStatus` 里取。**会话进行中拒绝下载**（同一
+  模型的四件套可能正被识别器占着，Windows 下写同名文件会失败）。
+- **状态搭 `Status.speech` 的顺风车，不给 `IpcResponse` 加字段**：`IpcResponse`
+  的 9 个字段有 71 处逐字段字面量构造（没有一处用 `..Default::default()`），加一个
+  字段 = 71 处改动 + 后续每次都要抄一遍；`Status` 只有 1 处构造点。代价是语义上
+  「Status 里混了语音」，用 `Option` + 只在语音命令里填来买单：**按键热路径
+  `get_ipc_status` 显式填 `None`**（填它要查模型目录，不能每个键事件都查盘）。
+- **设置页只在语音页在前台时发 IPC**（`Message::PageSelected` → 按标题反查页下标
+  → `set_active`）：250ms 轮询一个后台窗口没人看的页面，纯属白占 IPC 与磁盘
+  stat。**按标题反查下标而不是写死数字**——侧栏分组顺序会变（这页现在在「智能」
+  组），写死会静默错位（轮询挂到别的页上，比崩了更难查）。
+- **试听不上屏**（新增 `StartPreview` 命令 + `preview` 标志）：用户在设置页试听时
+  光标在哪个窗口是不确定的，识别结束时往那儿塞一段文字是最糟的交互；所以试听
+  模式 `finish_session` 只把最终文本留在快照里给页面显示，**不 commit、不弹 toast**。
+- **解压只取条目的文件名铺平**（`file_name()`，拒绝 `.`/`..`/空名）：模型包里有
+  一层顶层目录（`x-asr-.../encoder.int8.onnx`），我们只要平铺的四件套——顺带把
+  目录穿越这条路径彻底堵死，不依赖 tar 实现的路径校验。
+
+## 2026-10-02 CUDA 包：构建与分发（`msi-build.ps1 -Gpu`）
+
+- **CUDA 包与 CPU 包必须分开构建、分开分发，文件名也要分开**：两者
+  `onnxruntime.dll` 同名不同体（CUDA 版 15.5MB / CPU 版 17MB），装进同一目录会
+  互相覆盖；产物名带 `-cuda` 后缀，避免同版本号的两个包分不清。
+- **`-Gpu` 一定要同时切 `CARGO_TARGET_DIR=target-cuda`**：不是洁癖，是必须——
+  cargo 会把 sherpa 运行库拷进目标目录，共用 `target\release` 时最后一次构建的
+  flavor 会覆盖前一次的 DLL，打出来的包可能"CPU 包的 exe + CUDA 包的字面"。
+- **`-Gpu` 同时要改 `$TargetDir`，而不是只改 cargo 命令**：MSI 的其它资源
+  （rime.dll / data / user-data / resources）由 `msi-build.ps1` 自己暂存，原来写死
+  `target\release`；只切 cargo 不切暂存，CUDA 包会漏拷 rime.dll 而打出个起不来的
+  安装包（而且 candle 会照常成功）。
+- **`WithCudaDlls` 必须有 XML 里的默认值**（`<?ifndef ?>`）：预处理器变量没定义时
+  `<?if $(var.WithCudaDlls) = 1 ?>` 直接编不过——手工跑 candle 的人会撞上一个与
+  他无关的报错。三种传法（不传 / `=1` / `=0`）都实测 exit 0。
+- **`onnxruntime_providers_tensorrt.dll` 不进包**：实测它导 `nvinfer_10` /
+  `nvonnxparser_10` / `cudnn64_9`，我们既不用 TensorRT，也不会为了它去要求 cuDNN；
+  带进去只会在缺库机器上多一个能被加载探测撞见的雷。
+- **选 shared 链接而非默认 static**：静态把 ~90MB onnxruntime 打进 exe；shared
+  的 DLL（onnxruntime 17MB + sherpa-onnx-c-api 4.4MB）随 exe 旁置，每个分包带
+  自己的运行库集合——exe 目录在 DLL 搜索顺序里永远第一。**本机实坑**：
+  `C:\Windows\System32\onnxruntime.dll` 是别家软件放的 1.17.1，cargo test 的
+  测试二进制在 `target\debug\deps\`，其依赖解析先撞 System32 旧版 → API 版本
+  不匹配 → 访问冲突崩溃；本地跑测试须把 4 个 DLL 拷进 deps\（正式 exe 不受
+  影响，DLL 与 exe 同目录优先）。CI（GitHub runner）无此坑。
+
+## 2026-10-02 语音页产品化（用户反馈「做得不够产品化」「不应该是下拉切换吗」）
+
+- **单值配置一律用下拉，不用「每项一个按钮」**：语音页原来是「一个模型一行 +
+  每行一个『使用』按钮」，用户第一反应就是"这不该是下拉吗"。规则落定：
+  **当前用哪个模型 = 单值配置 → `pick_list`**；集合型数据（词典词条、市场列表、
+  已安装方案）才用表格/卡片列表。同一条原则词典页已经踩过（「词典 = 下拉选择，
+  不是每本词典一行按钮」），这里第二次印证 → 以后新页面直接照此判据。
+- **一个页面上只让用户看一套引擎，第二套必须自己退下去**：本地 sherpa 模型
+  （输入法真正用的）是主角，WinRT 系统听写降级为「系统听写（仅本页试听）」，
+  标题里就写明它不参与上屏。两套引擎并排成两张同等分量的表单卡，用户会以为
+  「我该配哪个」——那是把实现结构暴露成了产品结构。
+- **顶部先给结论，再给操作**：状态大卡一眼回答「能不能用、用哪个、走 CPU 还是
+  GPU、现在该干什么」，主操作只有一个（试听）；下载/删除这类**有副作用、需要
+  选对象**的动作，收进选中模型的详情里，不铺在首页。
+- **状态分类写进状态层（`SpeechStatusKind`），页面只选颜色**：`label()` /
+  `hint()` / `is_problem()` 全在 `speech_models.rs`，页面不再各写一遍
+  if/else 文案——否则同一种状态在两个页面会有两种说法。
+  另外**「还没拿到状态」必须与「管道不通」分开**（`Connecting` vs `Offline`），
+  否则刚进页面会闪一下「服务未运行」的假故障。
+- **面向用户的模型名是人话，工程 id 只做小字**：`X-ASR 中英文语音识别（带标点）`
+  → `中英混输（自动标点）`；`x-asr-480ms-zh-en-punct-int8` 退到详情里 12px。
+  首个内置模型挂「推荐」徽标（新增 `AsrModelRegistry::recommended_id()`，
+  `recommended` 一路透传 server → IPC → 设置页），省得用户对着两个陌生名字猜。
+- **`picker`/进度这类控件的样式也要与主题同源**：iced 默认 `pick_list` 用 iced
+  主题色、`progress_bar` 用默认轨道色，放进本应用自定义的 `ThemeColors` 卡片里
+  像"借来的控件"；统一在 `components/widgets.rs` 出 `pick_list_style()` /
+  `progress()`（6px 细条，尺寸走 `length/girth` 而不是 `width/height`）。
+- **改模型文件要挡在"引擎正忙"之外**：正在听写/装载时模型目录可能被识别器占着，
+  此时「重新下载/删除」按钮换成禁用的「正在使用中…」，而不是让用户点了看到 IO 错误。
+
+## 2026-10-02 候选栏 🎙️ 语音页：动效与状态要落在"看得见"上
+
+- **语音界面必须有输入电平**：对着面板说话时，用户唯一的问题是"它到底听到没有"。
+  没有电平反馈，用户只能靠猜（或者干脆以为坏了）。为此：
+  - 电平在**采集侧**算（`LevelEnvelope`：RMS → -50dBFS 静音 / -10dBFS 满格 →
+    快起慢落），面板仍只读内存快照。
+  - **不给 UI 加平滑状态**：`VoiceView` 参与 `PartialEq`，一旦引入"每拍都在变的
+    平滑量"，静默时也会一直重绘；把包络放在工作线程，UI 的"没变化不重绘"纪律
+    原样成立。
+  - 快照里的电平用 `u8`（0~100）而不是 `f32`：既保住 `Eq`（快照靠它判断变化），
+    也天然把重绘压到肉眼能分辨的档位。
+- **轮询频率按"最需要动的东西"定**：语音页从 120ms 提到 60ms，只因电平条在 8fps
+  下是台阶。提频的前提是"没变化不重绘"已经成立——否则提频等于每秒白重画 8 次。
+- **状态 → 色/文案的映射收进状态层**（`VoiceTone` + `VoiceTextKind`）：面板绘制
+  代码只做"按语义选画刷/格式"，不再在绘制分支里写 if/else 文案（与设置页
+  `SpeechStatusKind` 同一条纪律，两个界面不会各说一套话）。
+- **"能不能点"是按钮的一部分**：装载中 / 模型未下载 → 灰底 + 点击被忽略。
+  让按钮看起来能点、点下去却只写一句错误到快照（用户侧表现为"闪一下没反应"）
+  是比禁用更糟的交互。
+- **整行都是点击目标**：主按钮 116×28 只是"看得见的那颗"，命中的是整条状态行
+  （`panel_hit` 与绘制侧 hover 底色同源）。桌面鼠标 UI 也没有理由让人瞄准。
+- **文本区的语义分档**：实时文本（最大、正文色）/ 已上屏回执（正文色，正常字号）/
+  引导语（次级色）/ 错误（红）。**错误信息与"去哪修"分开**：文本区说错在哪，
+  底部提示行说去哪里解决（"设置 → 语音转文本：下载模型或检查麦克风"）。

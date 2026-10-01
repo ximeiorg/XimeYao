@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winxime_ipc::Context;
 
 use self::model::{CandidateModel, RenderedMetrics, RootModel};
-use self::panel::{PanelGrid, PanelList, PanelPage};
+use self::panel::{PanelGrid, PanelList, PanelPage, VoiceView};
 use self::view::RenderedView;
 use crate::recent_usage;
 
@@ -58,6 +58,11 @@ pub struct CandidateWindow {
     /// 网格子页状态（表情 / 符号：当前标签、当前页、最近使用记录；
     /// 进入该页时读一次 recent_usage.json，绘制只读内存）。
     pub(crate) panel_grid: RefCell<PanelGrid>,
+    /// 语音页（🎙️）缓存状态：进页 / 定时器拍 / 点击后由
+    /// [`CandidateWindow::refresh_voice`] 从语音引擎快照刷新，绘制只读它。
+    pub(crate) voice: RefCell<VoiceView>,
+    /// 语音页的定时器是否已开（聆听中靠定时器把 partial 文本刷到面板上）。
+    pub(crate) voice_timer: Cell<bool>,
     /// 最近一次布局结果（用于 ⋮ 按钮/面板/候选命中测试）。
     pub(crate) metrics: RefCell<Option<RenderedMetrics>>,
 }
@@ -130,6 +135,13 @@ impl CandidateWindow {
         };
     }
 
+    /// 刷新语音页缓存；返回「有无变化」（调用方据此决定是否重绘）。
+    ///
+    /// `check_model` 只在进页时为 true：模型是否下载要看磁盘，定时器每拍不查盘。
+    pub(crate) fn refresh_voice(&self, check_model: bool) -> bool {
+        self.voice.borrow_mut().refresh(check_model)
+    }
+
     pub fn new() -> Arc<Self> {
         let window = Arc::new(Self {
             model: RefCell::new(CandidateModel::default()),
@@ -140,6 +152,8 @@ impl CandidateWindow {
             hovered_item: Cell::new(None),
             panel_list: RefCell::new(PanelList::default()),
             panel_grid: RefCell::new(PanelGrid::default()),
+            voice: RefCell::new(VoiceView::default()),
+            voice_timer: Cell::new(false),
             metrics: RefCell::new(None),
         });
 

@@ -16,6 +16,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory1, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
     DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
@@ -25,6 +26,7 @@ use windows_core::{w, HSTRING};
 use super::glyph::{self, GlyphKind};
 use super::model::CandidateModel;
 use super::PanelPaintState;
+use crate::speech::SpeechState;
 
 // ── 布局常量（与 macOS 版 candidate_window.rs 对齐，单位为 DIP）──
 /// 候选栏右侧 "⋮" 菜单按钮。
@@ -526,6 +528,256 @@ impl PanelGrid {
     }
 }
 
+/// 语音页（🎙️）绘制数据。
+///
+/// 与 [`PanelList`] / [`PanelGrid`] 同一条纪律：面板绘制在 UI 线程、逐帧只读内存，
+/// 这份缓存由 `ui::CandidateWindow::refresh_voice` 在「进页 / 定时器拍 / 点击后」刷新
+/// （唯一的全局状态读取口在 [`VoiceView::refresh`]）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct VoiceView {
+    /// 语音引擎状态。
+    pub(crate) state: SpeechState,
+    /// 模型四件套是否已下载（进页时查一次，定时器里不查盘）。
+    pub(crate) model_ready: bool,
+    /// 实时识别文本。
+    pub(crate) partial: String,
+    /// 最近一次错误（模型缺失 / 麦克风打不开）。
+    pub(crate) error: Option<String>,
+    /// 最近一次上屏文本。
+    pub(crate) last_commit: Option<String>,
+    /// 输入电平 0~100（聆听中的电平条；快照里的值，UI 不再平滑）。
+    pub(crate) level: u8,
+}
+
+/// 语音页的「状态色」：决定状态文字、电平条、主按钮的着色（页面只按它选画刷）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceTone {
+    /// 就绪待命。
+    Ready,
+    /// 正在听（主色高亮）。
+    Listening,
+    /// 正在装载模型。
+    Loading,
+    /// 用不了（模型没下载）——不是错误，但需要用户先做一件事。
+    Blocked,
+    /// 出错了（红色）。
+    Error,
+}
+
+/// 文本区的语义：决定字号与颜色（实时文本最大最亮，占位语最淡）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceTextKind {
+    /// 实时识别中的文本（跟读效果）。
+    Live,
+    /// 已上屏的回执。
+    Committed,
+    /// 占位/引导语。
+    Placeholder,
+    /// 错误信息。
+    Alert,
+}
+
+impl VoiceView {
+    /// 从语音引擎快照刷新；`check_model` 为 true 时顺带查一次模型文件
+    /// （进页时用；定时器每拍只读内存快照，不触盘）。
+    /// 返回「与刷新前相比有无变化」——调用方据此决定要不要重绘。
+    pub(crate) fn refresh(&mut self, check_model: bool) -> bool {
+        let snapshot = crate::speech::SpeechEngine::global_snapshot();
+        let before = self.clone();
+        self.state = snapshot.state;
+        self.partial = snapshot.partial;
+        self.error = snapshot.error;
+        self.last_commit = snapshot.last_commit;
+        self.level = snapshot.level;
+        if check_model {
+            self.model_ready = crate::speech::SpeechEngine::global_model_ready();
+        }
+        *self != before
+    }
+
+    /// 是否正在采集（电平条 / 文案分支都看它）。
+    pub(crate) fn listening(&self) -> bool {
+        self.state == SpeechState::Listening
+    }
+
+    /// 状态色。
+    pub(crate) fn tone(&self) -> VoiceTone {
+        if self.error.is_some() {
+            return VoiceTone::Error;
+        }
+        match self.state {
+            SpeechState::Listening => VoiceTone::Listening,
+            SpeechState::Loading => VoiceTone::Loading,
+            SpeechState::Idle => {
+                if self.model_ready {
+                    VoiceTone::Ready
+                } else {
+                    VoiceTone::Blocked
+                }
+            }
+        }
+    }
+
+    /// 主按钮文案：**短**（116px 胶囊里放得下），长句都交给状态行与底部提示。
+    pub(crate) fn button_label(&self) -> &'static str {
+        if self.listening() {
+            return "结束并上屏";
+        }
+        match self.state {
+            SpeechState::Loading => "准备中…",
+            _ => {
+                if self.model_ready {
+                    "开始说话"
+                } else {
+                    "未下载模型"
+                }
+            }
+        }
+    }
+
+    /// 主按钮能不能点：装载中、以及模型没下载时点它没用，直接不给点
+    /// （点了只会写一句错误到快照，用户看到的还是"没反应"）。
+    pub(crate) fn button_enabled(&self) -> bool {
+        if self.listening() {
+            return true;
+        }
+        match self.state {
+            SpeechState::Loading => false,
+            _ => self.model_ready,
+        }
+    }
+
+    /// 状态行左侧文字（≤6 字，跟主按钮同居一行）。
+    pub(crate) fn state_label(&self) -> &'static str {
+        match self.tone() {
+            VoiceTone::Error => "出错了",
+            VoiceTone::Listening => "正在听…",
+            VoiceTone::Loading => "正在准备",
+            VoiceTone::Blocked => "模型未下载",
+            VoiceTone::Ready => "麦克风就绪",
+        }
+    }
+
+    /// 文本区内容 + 语义。
+    pub(crate) fn text_view(&self) -> (String, VoiceTextKind) {
+        if let Some(error) = &self.error {
+            return (error.clone(), VoiceTextKind::Alert);
+        }
+        if self.listening() {
+            if self.partial.trim().is_empty() {
+                return ("请对着麦克风说话…".to_string(), VoiceTextKind::Placeholder);
+            }
+            return (self.partial.clone(), VoiceTextKind::Live);
+        }
+        if let Some(text) = &self.last_commit {
+            return (format!("已上屏：{text}"), VoiceTextKind::Committed);
+        }
+        if !self.model_ready {
+            return (
+                "还没有语音模型：先在设置里下载一个".to_string(),
+                VoiceTextKind::Placeholder,
+            );
+        }
+        (
+            "点「开始说话」，说完停顿就会自动上屏".to_string(),
+            VoiceTextKind::Placeholder,
+        )
+    }
+
+    /// 底部提示行（一行小字：怎么用 / 出了问题去哪）。
+    pub(crate) fn footer_label(&self) -> &'static str {
+        match self.tone() {
+            VoiceTone::Error => "设置 → 语音转文本：下载模型或检查麦克风",
+            VoiceTone::Listening => "说完停顿自动上屏 · Esc 取消",
+            VoiceTone::Loading => "首次装载模型需要几秒，之后常驻",
+            VoiceTone::Blocked => "设置 → 语音转文本：下载模型",
+            VoiceTone::Ready => "语音只在本机识别，不出电脑",
+        }
+    }
+}
+
+/// 语音页状态行高度（🎙️ + 状态文字 + 主按钮同居一行）。
+const VOICE_ROW_HEIGHT: f32 = 32.0;
+
+/// 语音页主按钮宽度（右侧胶囊）。
+const VOICE_BUTTON_WIDTH: f32 = 116.0;
+
+/// 语音页主按钮高度。
+const VOICE_BUTTON_HEIGHT: f32 = 28.0;
+
+/// 输入电平条高度（状态行下面的一条细线）。
+const VOICE_METER_HEIGHT: f32 = 4.0;
+
+/// 文本区与电平条之间的间隙。
+const VOICE_TEXT_GAP: f32 = 2.0;
+
+/// 语音页底部提示行高度。
+const VOICE_FOOTER_HEIGHT: f32 = 14.0;
+
+/// 语音页状态行左侧的图标框宽度（🎙️ 用彩色 emoji 字体单独画）。
+const VOICE_ICON_BOX: f32 = 22.0;
+
+/// 语音页状态行矩形 (left, top, right, bottom)（面板内坐标）。
+///
+/// 整行都是点击目标：只让 116px 的按钮可点，鼠标要瞄，产品上没必要。
+fn voice_row_rect(width: f32) -> (f32, f32, f32, f32) {
+    let top = PANEL_HEADER_HEIGHT + PANEL_CONTENT_GAP;
+    (
+        PANEL_H_INSET,
+        top,
+        width - PANEL_H_INSET,
+        top + VOICE_ROW_HEIGHT,
+    )
+}
+
+/// 语音页主按钮矩形（状态行内右侧胶囊）。
+fn voice_button_rect(width: f32) -> (f32, f32, f32, f32) {
+    let row = voice_row_rect(width);
+    let top = row.1 + (VOICE_ROW_HEIGHT - VOICE_BUTTON_HEIGHT) / 2.0;
+    (
+        row.2 - VOICE_BUTTON_WIDTH,
+        top,
+        row.2,
+        top + VOICE_BUTTON_HEIGHT,
+    )
+}
+
+/// 语音页状态文字矩形（图标右侧到按钮左侧）。
+fn voice_label_rect(width: f32) -> (f32, f32, f32, f32) {
+    let row = voice_row_rect(width);
+    let button = voice_button_rect(width);
+    (row.0 + VOICE_ICON_BOX, row.1, button.0 - PANEL_ROW_GAP, row.3)
+}
+
+/// 语音页输入电平条矩形（状态行之下、满内容宽）。
+fn voice_meter_rect(width: f32) -> (f32, f32, f32, f32) {
+    let row = voice_row_rect(width);
+    (
+        PANEL_H_INSET,
+        row.3,
+        width - PANEL_H_INSET,
+        row.3 + VOICE_METER_HEIGHT,
+    )
+}
+
+/// 语音页文本区矩形（电平条之下到提示行之上的整块）。
+fn voice_text_rect(width: f32) -> (f32, f32, f32, f32) {
+    let top = voice_meter_rect(width).3 + VOICE_TEXT_GAP;
+    let bottom = PANEL_HEIGHT - PANEL_BOTTOM_MARGIN - VOICE_FOOTER_HEIGHT;
+    (PANEL_H_INSET, top, width - PANEL_H_INSET, bottom)
+}
+
+/// 语音页底部提示行矩形（贴面板底边距）。
+fn voice_footer_rect(width: f32) -> (f32, f32, f32, f32) {
+    let bottom = PANEL_HEIGHT - PANEL_BOTTOM_MARGIN;
+    (
+        PANEL_H_INSET,
+        bottom - VOICE_FOOTER_HEIGHT,
+        width - PANEL_H_INSET,
+        bottom,
+    )
+}
+
 /// 列表子页第 row 行的 y（面板内坐标）。
 fn list_row_y(row: usize) -> f32 {
     PANEL_HEADER_HEIGHT + PANEL_CONTENT_GAP + row as f32 * (PANEL_ITEM_HEIGHT + PANEL_ROW_GAP)
@@ -762,6 +1014,8 @@ pub(crate) enum PanelHit {
     GlyphTab(usize),
     /// 命中网格子页当前页第 i 格（格内下标，行优先）。
     GlyphCell(usize),
+    /// 命中语音页主按钮（点一下开始 / 结束识别）。
+    VoiceToggle,
     /// 命中「上一页」（列表子页与网格子页共用底部翻页条）。
     PrevPage,
     /// 命中「下一页」。
@@ -850,6 +1104,17 @@ pub(crate) fn panel_hit(
                 None
             }
         }
+        PanelPage::VoiceInput => {
+            // 返回按钮先判（它在标题栏里，与状态行纵向不重叠）。
+            if rect_contains(panel_back_rect(panel_width), x, y) {
+                return Some(PanelHit::Back);
+            }
+            // 整条状态行都是点击目标（绘制侧的 hover 底色与它同源）。
+            if rect_contains(voice_row_rect(panel_width), x, y) {
+                return Some(PanelHit::VoiceToggle);
+            }
+            None
+        }
         _ => {
             if rect_contains(panel_back_rect(panel_width), x, y) {
                 Some(PanelHit::Back)
@@ -927,6 +1192,7 @@ pub(crate) fn draw_panel(
     state: PanelPaintState,
     list: &PanelList,
     grid: &PanelGrid,
+    voice: &VoiceView,
 ) -> Result<(), String> {
     let page = state.page;
     let hovered_item = state.hovered_item;
@@ -1009,6 +1275,48 @@ pub(crate) fn draw_panel(
                 None,
             )
             .map_err(|e| format!("CreateSolidColorBrush panel_line failed: {:?}", e))?;
+        // 语音页要的四支笔：主色（状态点/电平条/主按钮）、主色上的文字、
+        // 错误红、以及最淡的提示行。面板底色是浅色硬编码（见上），
+        // 所以错误红也用固定的高对比红，不跟主题走。
+        let accent_brush = d2d
+            .CreateSolidColorBrush(&model.highlight_bg_color, None)
+            .map_err(|e| format!("CreateSolidColorBrush panel_accent failed: {:?}", e))?;
+        let on_accent_brush = d2d
+            .CreateSolidColorBrush(&model.highlight_fg_color, None)
+            .map_err(|e| format!("CreateSolidColorBrush panel_on_accent failed: {:?}", e))?;
+        let error_brush = d2d
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.90,
+                    g: 0.28,
+                    b: 0.23,
+                    a: 1.0,
+                },
+                None,
+            )
+            .map_err(|e| format!("CreateSolidColorBrush panel_error failed: {:?}", e))?;
+        let faint_brush = d2d
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                    a: 0.40,
+                },
+                None,
+            )
+            .map_err(|e| format!("CreateSolidColorBrush panel_faint failed: {:?}", e))?;
+        let meter_track_brush = d2d
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                    a: 0.14,
+                },
+                None,
+            )
+            .map_err(|e| format!("CreateSolidColorBrush panel_meter failed: {:?}", e))?;
 
         let center_format = make_text_format(
             dwrite,
@@ -1044,6 +1352,52 @@ pub(crate) fn draw_panel(
             model.font_size - 2.0,
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_TEXT_ALIGNMENT_CENTER,
+            true,
+        )?;
+        // 语音页的 🎙️ 用彩色 emoji 字体画（与菜单卡片图标同一套做法）；
+        // 它画在 32px 的状态行里，所以比正文大不了多少。
+        let voice_icon_format = make_text_format(
+            dwrite,
+            &HSTRING::from("Segoe UI Emoji"),
+            (model.font_size + 1.0).max(12.0),
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            true,
+        )?;
+        // 语音页状态文字：半粗、一档正文大小（状态行里只有它和按钮）。
+        let voice_label_format = make_text_format(
+            dwrite,
+            &model.font_family,
+            model.font_size.max(12.0),
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            true,
+        )?;
+        // 语音页主按钮文字：居中、半粗、比正文小一档（116px 胶囊里放得下）。
+        let voice_button_format = make_text_format(
+            dwrite,
+            &model.font_family,
+            (model.font_size - 1.0).max(12.0),
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            true,
+        )?;
+        // 语音页识别文本：**比候选字大两档**——它是这一页唯一的主角。
+        let voice_text_format = make_text_format(
+            dwrite,
+            &model.font_family,
+            model.font_size + 2.0,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            true,
+        )?;
+        // 语音页底部提示行：最小的一档（只读信息，不抢视线）。
+        let voice_footer_format = make_text_format(
+            dwrite,
+            &model.font_family,
+            (model.font_size - 3.0).max(11.0),
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
             true,
         )?;
 
@@ -1570,6 +1924,137 @@ pub(crate) fn draw_panel(
                                 );
                             }
                         }
+                    }
+                    PanelPage::VoiceInput => {
+                        // 版式：状态行（🎙️ + 状态文字 + 主按钮）/ 电平条 / 识别文本 / 提示行。
+                        // 顺序就是「我在哪 → 它在听吗 → 说了什么 → 接下来怎么用」。
+                        let row = voice_row_rect(panel_width);
+                        let button = voice_button_rect(panel_width);
+                        let hovered = hovered_item == Some(0);
+                        let tone = voice.tone();
+                        let rounded = |rect: (f32, f32, f32, f32), radius: f32| D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: panel_left + rect.0,
+                                top: panel_y + rect.1,
+                                right: panel_left + rect.2,
+                                bottom: panel_y + rect.3,
+                            },
+                            radiusX: radius,
+                            radiusY: radius,
+                        };
+                        let rect_of = |rect: (f32, f32, f32, f32)| D2D_RECT_F {
+                            left: panel_left + rect.0,
+                            top: panel_y + rect.1,
+                            right: panel_left + rect.2,
+                            bottom: panel_y + rect.3,
+                        };
+
+                        // 整行是点击目标：悬停时铺一层浅底，让"这一整行都能点"看得见。
+                        if hovered {
+                            d2d.FillRoundedRectangle(&rounded(row, radius), &card_brush);
+                        }
+
+                        // 🎙️ 页面图标（彩色 emoji 字体，与菜单卡片图标同一套做法）。
+                        let icon_hstring = HSTRING::from("🎙️");
+                        d2d.DrawText(
+                            &icon_hstring,
+                            &voice_icon_format,
+                            &rect_of((
+                                row.0,
+                                row.1,
+                                row.0 + VOICE_ICON_BOX,
+                                row.3,
+                            )),
+                            &text_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // 状态文字：颜色带语义（聆听=主色、出错=红、不可用=次级）。
+                        let label_hstring = HSTRING::from(voice.state_label());
+                        let label_brush = match tone {
+                            VoiceTone::Listening => &accent_brush,
+                            VoiceTone::Error => &error_brush,
+                            VoiceTone::Blocked | VoiceTone::Loading => &secondary_brush,
+                            VoiceTone::Ready => &text_brush,
+                        };
+                        d2d.DrawText(
+                            &label_hstring,
+                            &voice_label_format,
+                            &rect_of(voice_label_rect(panel_width)),
+                            label_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // 主按钮：可点 → 主色胶囊；不可点（装载中 / 未下载）→ 灰底次要文字。
+                        let enabled = voice.button_enabled();
+                        d2d.FillRoundedRectangle(
+                            &rounded(button, VOICE_BUTTON_HEIGHT / 2.0),
+                            if enabled { &accent_brush } else { &card_brush },
+                        );
+                        let button_hstring = HSTRING::from(voice.button_label());
+                        d2d.DrawText(
+                            &button_hstring,
+                            &voice_button_format,
+                            &rect_of(button),
+                            if enabled {
+                                &on_accent_brush
+                            } else {
+                                &secondary_brush
+                            },
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // 电平条：只在聆听中画。用户要看到"它在听我说话"，
+                        // 否则对着面板说话时完全不知道麦克风有没有进声音。
+                        if voice.listening() {
+                            let meter = voice_meter_rect(panel_width);
+                            d2d.FillRoundedRectangle(
+                                &rounded(meter, VOICE_METER_HEIGHT / 2.0),
+                                &meter_track_brush,
+                            );
+                            let filled = (meter.2 - meter.0) * (voice.level.min(100) as f32 / 100.0);
+                            if filled > 1.0 {
+                                d2d.FillRoundedRectangle(
+                                    &rounded(
+                                        (meter.0, meter.1, meter.0 + filled, meter.3),
+                                        VOICE_METER_HEIGHT / 2.0,
+                                    ),
+                                    &accent_brush,
+                                );
+                            }
+                        }
+
+                        // 识别文本 / 回执 / 引导语 / 错误：语义决定字号与颜色。
+                        let (text_value, kind) = voice.text_view();
+                        let (format, brush) = match kind {
+                            VoiceTextKind::Live => (&voice_text_format, &text_brush),
+                            VoiceTextKind::Committed => (&left_format, &text_brush),
+                            VoiceTextKind::Placeholder => (&left_format, &secondary_brush),
+                            VoiceTextKind::Alert => (&left_format, &error_brush),
+                        };
+                        let text_hstring = HSTRING::from(text_value);
+                        d2d.DrawText(
+                            &text_hstring,
+                            format,
+                            &rect_of(voice_text_rect(panel_width)),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // 底部提示行：怎么用（聆听中）/ 去哪解决（出错或没模型）。
+                        let footer_hstring = HSTRING::from(voice.footer_label());
+                        d2d.DrawText(
+                            &footer_hstring,
+                            &voice_footer_format,
+                            &rect_of(voice_footer_rect(panel_width)),
+                            &faint_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
                     }
                     _ => {
                         // 其它功能页面（v1 占位）：占位内容居中于标题栏与品牌栏之间。
@@ -2217,5 +2702,189 @@ mod tests {
         assert_eq!(list_display_text(&exact), exact);
         // 触发编码走同一个折行/截断规则显示。
         assert_eq!(list_display_text("dh"), "dh");
+    }
+
+    #[test]
+    fn voice_page_layout_fits_between_header_and_bottom() {
+        let w = PANEL_MIN_WIDTH;
+        let row = voice_row_rect(w);
+        let button = voice_button_rect(w);
+        let text = voice_text_rect(w);
+        let meter = voice_meter_rect(w);
+        let footer = voice_footer_rect(w);
+        // 状态行在标题栏之下、左右留白之内。
+        assert!(row.1 >= PANEL_HEADER_HEIGHT);
+        assert!(row.0 >= 0.0 && row.2 <= w);
+        assert!((row.3 - row.1 - VOICE_ROW_HEIGHT).abs() < 1e-4);
+        // 主按钮在状态行里、贴右侧，高度是常量且比行矮（胶囊不撑满行）。
+        assert!(button.0 >= row.0 && button.2 <= row.2 + 1e-4);
+        assert!((button.2 - row.2).abs() < 1e-4, "主按钮应贴右");
+        assert!((button.3 - button.1 - VOICE_BUTTON_HEIGHT).abs() < 1e-4);
+        assert!(button.1 >= row.1 && button.3 <= row.3);
+        // 状态文字在图标右侧、按钮左侧（不与按钮重叠）。
+        let label = voice_label_rect(w);
+        assert!(label.0 >= row.0 + VOICE_ICON_BOX || label.0 <= row.2);
+        assert!(label.2 <= button.0 + 1e-4);
+        // 电平条紧贴状态行下方，满内容宽，且不压到文本区。
+        assert!((meter.1 - row.3).abs() < 1e-4);
+        assert!((meter.3 - meter.1 - VOICE_METER_HEIGHT).abs() < 1e-4);
+        assert!((meter.0 - row.0).abs() < 1e-4 && (meter.2 - row.2).abs() < 1e-4);
+        // 文本区在电平条之下、提示行之上；提示行贴面板底边距。
+        assert!(text.1 >= meter.3);
+        assert!(text.3 <= footer.1 + 1e-4);
+        assert!(text.2 <= w && text.0 >= 0.0);
+        assert!((footer.3 - (PANEL_HEIGHT - PANEL_BOTTOM_MARGIN)).abs() < 1e-4);
+        assert!((footer.3 - footer.1 - VOICE_FOOTER_HEIGHT).abs() < 1e-4);
+        // 语音页与菜单页一样高（无翻页条 / 标签栏要撑高）。
+        assert!((panel_height(PanelPage::VoiceInput) - PANEL_HEIGHT).abs() < 1e-4);
+    }
+
+    #[test]
+    fn voice_page_hit_routes_whole_status_row_and_back() {
+        let w = PANEL_MIN_WIDTH;
+        let empty = PanelList::default();
+        // 主按钮中心可点。
+        let (bx, by) = center(voice_button_rect(w));
+        assert_eq!(
+            hit(PanelPage::VoiceInput, w, &empty, bx, by),
+            Some(PanelHit::VoiceToggle)
+        );
+        // 状态行左侧（图标/状态文字那一段）也可点——整行都是目标，不用瞄准按钮。
+        let row = voice_row_rect(w);
+        assert_eq!(
+            hit(PanelPage::VoiceInput, w, &empty, row.0 + 4.0, row.1 + 4.0),
+            Some(PanelHit::VoiceToggle)
+        );
+        // 返回按钮优先于状态行（都在面板内，位置不同）。
+        let (back_x, back_y) = center(panel_back_rect(w));
+        assert_eq!(
+            hit(PanelPage::VoiceInput, w, &empty, back_x, back_y),
+            Some(PanelHit::Back)
+        );
+        // 文本区与底部提示行不可点（点它不该开始识别）。
+        let (tx, ty) = center(voice_text_rect(w));
+        assert_eq!(hit(PanelPage::VoiceInput, w, &empty, tx, ty), None);
+        let (fx, fy) = center(voice_footer_rect(w));
+        assert_eq!(hit(PanelPage::VoiceInput, w, &empty, fx, fy), None);
+    }
+
+    /// 语音页文案：状态 → 状态色 / 状态文字 / 主按钮 / 底部提示。
+    #[test]
+    fn voice_labels_follow_state_and_model() {
+        // 模型没下载：按钮直接说明白、且不可点，底部给下载路径。
+        let missing = VoiceView::default();
+        assert_eq!(missing.tone(), VoiceTone::Blocked);
+        assert_eq!(missing.state_label(), "模型未下载");
+        assert_eq!(missing.button_label(), "未下载模型");
+        assert!(!missing.button_enabled(), "没模型时按钮不该可点");
+        assert_eq!(missing.footer_label(), "设置 → 语音转文本：下载模型");
+        assert_eq!(
+            missing.text_view().0,
+            "还没有语音模型：先在设置里下载一个"
+        );
+
+        // 就绪待命：能点、给引导语。
+        let idle = VoiceView {
+            model_ready: true,
+            ..VoiceView::default()
+        };
+        assert_eq!(idle.tone(), VoiceTone::Ready);
+        assert_eq!(idle.state_label(), "麦克风就绪");
+        assert_eq!(idle.button_label(), "开始说话");
+        assert!(idle.button_enabled());
+        assert_eq!(idle.footer_label(), "语音只在本机识别，不出电脑");
+        assert_eq!(
+            idle.text_view(),
+            (
+                "点「开始说话」，说完停顿就会自动上屏".to_string(),
+                VoiceTextKind::Placeholder
+            )
+        );
+
+        // 装载中：按钮变灰且不可点（点了只会白等）。
+        let loading = VoiceView {
+            model_ready: true,
+            state: SpeechState::Loading,
+            ..VoiceView::default()
+        };
+        assert_eq!(loading.tone(), VoiceTone::Loading);
+        assert_eq!(loading.state_label(), "正在准备");
+        assert_eq!(loading.button_label(), "准备中…");
+        assert!(!loading.button_enabled());
+
+        // 聆听中：能点（结束并上屏）、提示 Esc、空文本给引导语。
+        let listening = VoiceView {
+            model_ready: true,
+            state: SpeechState::Listening,
+            ..VoiceView::default()
+        };
+        assert_eq!(listening.tone(), VoiceTone::Listening);
+        assert_eq!(listening.state_label(), "正在听…");
+        assert_eq!(listening.button_label(), "结束并上屏");
+        assert!(listening.button_enabled());
+        assert_eq!(listening.footer_label(), "说完停顿自动上屏 · Esc 取消");
+        assert_eq!(
+            listening.text_view(),
+            (
+                "请对着麦克风说话…".to_string(),
+                VoiceTextKind::Placeholder
+            )
+        );
+        // 有 partial 就显示 partial（实时文本是最亮的一档）。
+        let partial = VoiceView {
+            partial: "你好世界".to_string(),
+            ..listening.clone()
+        };
+        assert_eq!(
+            partial.text_view(),
+            ("你好世界".to_string(), VoiceTextKind::Live)
+        );
+
+        // 错误优先于其它状态（模型缺失 / 麦克风打不开都走这里）。
+        let failed = VoiceView {
+            error: Some("麦克风打不开".to_string()),
+            ..listening
+        };
+        assert_eq!(failed.tone(), VoiceTone::Error);
+        assert_eq!(failed.state_label(), "出错了");
+        assert_eq!(
+            failed.text_view(),
+            ("麦克风打不开".to_string(), VoiceTextKind::Alert)
+        );
+        // 出错时提示行要把"去哪修"说清楚，而不是重复错误本身（错误已在文本区）。
+        assert!(failed.footer_label().contains("语音转文本"));
+
+        // 上屏过：待命时显示最近一次上屏内容（回执态）。
+        let committed = VoiceView {
+            model_ready: true,
+            last_commit: Some("已经上屏了".to_string()),
+            ..VoiceView::default()
+        };
+        assert_eq!(
+            committed.text_view(),
+            ("已上屏：已经上屏了".to_string(), VoiceTextKind::Committed)
+        );
+    }
+
+    /// 电平条只在聆听中画，且电平值原样来自快照（UI 不做平滑）。
+    #[test]
+    fn voice_level_is_carried_from_snapshot_and_only_drawn_while_listening() {
+        let mut view = VoiceView::default();
+        assert!(!view.listening());
+        view.state = SpeechState::Listening;
+        view.level = 37;
+        assert!(view.listening());
+        assert_eq!(view.level, 37);
+        // 电平参与「有没有变化」的比较：变了就得重绘（否则电平条是死的）。
+        let same = VoiceView {
+            level: 37,
+            ..view.clone()
+        };
+        assert_eq!(view, same);
+        let louder = VoiceView {
+            level: 60,
+            ..view.clone()
+        };
+        assert_ne!(view, louder);
     }
 }

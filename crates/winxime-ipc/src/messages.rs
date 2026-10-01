@@ -65,6 +65,11 @@ pub struct Status {
     pub schema_id: String,
     pub ascii_mode: bool,
     pub composing: bool,
+    /// 语音子状态：**只有语音相关命令才填**（其余命令留 None——它是按键热路径，
+    /// 不能每次都去查模型目录）。这样新加字段也不用改 `IpcResponse` 那几十处
+    /// 逐字段字面量。
+    #[serde(default)]
+    pub speech: Option<SpeechStatus>,
 }
 
 impl Default for Status {
@@ -74,8 +79,81 @@ impl Default for Status {
             schema_id: String::new(),
             ascii_mode: false,
             composing: false,
+            speech: None,
         }
     }
+}
+
+/// 语音状态快照（设置页「语音转文本」区的一屏数据）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SpeechStatus {
+    /// 引擎状态：`idle` / `loading` / `listening`。
+    #[serde(default)]
+    pub state: String,
+    /// 当前选中的模型 id。
+    #[serde(default)]
+    pub model_id: String,
+    /// 当前选中的模型展示名。
+    #[serde(default)]
+    pub model_name: String,
+    /// 选中模型是否已下载完整。
+    #[serde(default)]
+    pub model_ready: bool,
+    /// 推理后端说明（如 `CPU` / `CUDA（GPU）`）。
+    #[serde(default)]
+    pub provider: String,
+    /// 实时识别文本（试听时用）。
+    #[serde(default)]
+    pub text: String,
+    /// 最近一次错误（会话失败 / 模型操作失败）。
+    #[serde(default)]
+    pub error: Option<String>,
+    /// 正在下载的模型与进度（None = 没有下载在进行）。
+    #[serde(default)]
+    pub download: Option<SpeechDownload>,
+    /// 模型集合变化计数：与上一次不同就重查 `models`。
+    #[serde(default)]
+    pub models_rev: u64,
+    /// 可管理的模型列表。
+    #[serde(default)]
+    pub models: Vec<SpeechModel>,
+}
+
+/// 下载中的模型与进度。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SpeechDownload {
+    /// 目标模型 id。
+    #[serde(default)]
+    pub model_id: String,
+    /// 进度 0.0~1.0。
+    #[serde(default)]
+    pub progress: f32,
+}
+
+/// 可管理的一个语音模型。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SpeechModel {
+    /// 模型 id。
+    #[serde(default)]
+    pub id: String,
+    /// 展示名。
+    #[serde(default)]
+    pub name: String,
+    /// 一句话描述。
+    #[serde(default)]
+    pub description: String,
+    /// 下载包大小（展示用）。
+    #[serde(default)]
+    pub size: String,
+    /// 四件套是否已下载完整。
+    #[serde(default)]
+    pub downloaded: bool,
+    /// 是否为当前选中。
+    #[serde(default)]
+    pub selected: bool,
+    /// 是否为推荐模型（设置页挂「推荐」标记）。
+    #[serde(default)]
+    pub recommended: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -135,6 +213,19 @@ pub enum IpcCommand {
     UninstallSchema,
     ListMarketSchemas,
     ListInstalledPackages,
+    // 语音（本地离线模型）：设置页的「语音转文本」区驱动 server 侧的语音引擎。
+    /// 读语音状态：当前模型 / 可管理模型列表 / 下载进度 / 引擎状态。
+    GetSpeechStatus,
+    /// 开始下载模型（data = SpeechModel(id)）；立即返回，进度靠 GetSpeechStatus 轮询。
+    SpeechDownload,
+    /// 删除模型目录（data = SpeechModel(id)）。
+    SpeechDelete,
+    /// 切换当前使用的模型（data = SpeechModel(id)）。
+    SpeechSelect,
+    /// 试听：让 server 开一次识别会话（麦克风归 server 所有，面板与设置页共用）。
+    SpeechTestStart,
+    /// 试听结束：停止并**不上屏**（设置页试听不该往用户光标处塞文本）。
+    SpeechTestStop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +266,8 @@ pub enum IpcRequestData {
     CustomPhraseTable(String, Vec<CustomPhraseEntry>),
     /// 系统通知内容（ShowToast）。
     Toast(ToastMessage),
+    /// 语音模型操作的目标模型 id（SpeechDownload / SpeechDelete / SpeechSelect）。
+    SpeechModel(String),
 }
 
 /// 系统通知标题 + 正文。

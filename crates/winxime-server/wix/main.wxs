@@ -6,6 +6,11 @@
     <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
 <?endif ?>
 
+<!-- CUDA 分包开关：默认 0（CPU 包），msi-build.ps1 -Gpu 传 -dWithCudaDlls=1。 -->
+<?ifndef WithCudaDlls ?>
+    <?define WithCudaDlls = 0 ?>
+<?endif ?>
+
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
 
     <Product
@@ -96,6 +101,55 @@
                             Source='$(var.CargoTargetBinDir)\rime.dll'
                             KeyPath='yes'/>
                     </Component>
+                    <!-- 语音（sherpa-onnx）运行库：server 导入表直接引用 c-api，
+                         缺了 server 起不来。 -->
+                    <Component Id='sherpa_dll' Guid='*'>
+                        <File
+                            Id='sherpa0'
+                            Name='sherpa-onnx-c-api.dll'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\sherpa-onnx-c-api.dll'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='sherpa_cxx_dll' Guid='*'>
+                        <File
+                            Id='sherpacxx0'
+                            Name='sherpa-onnx-cxx-api.dll'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\sherpa-onnx-cxx-api.dll'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='onnxruntime_dll' Guid='*'>
+                        <File
+                            Id='onnxruntime0'
+                            Name='onnxruntime.dll'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\onnxruntime.dll'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='onnxruntime_providers_dll' Guid='*'>
+                        <File
+                            Id='onnxruntimeproviders0'
+                            Name='onnxruntime_providers_shared.dll'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\onnxruntime_providers_shared.dll'
+                            KeyPath='yes'/>
+                    </Component>
+                    <?if $(var.WithCudaDlls) = 1 ?>
+                    <!-- CUDA 包专用：onnxruntime 的 CUDA EP 实现（255MB）。
+                         它硬依赖 CUDA 13 运行库的 cublas64_13/cublasLt64_13.dll
+                         （**不**依赖 cuDNN 9；只有我们不装的 TensorRT EP 才要 cuDNN）。
+                         不随包分发 CUDA 运行库（数百 MB），由用户装 CUDA 13 运行库；
+                         缺库时 server 探测到就回退 CPU，不会崩。 -->
+                    <Component Id='onnxruntime_cuda_dll' Guid='*'>
+                        <File
+                            Id='onnxruntimecuda0'
+                            Name='onnxruntime_providers_cuda.dll'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\onnxruntime_providers_cuda.dll'
+                            KeyPath='yes'/>
+                    </Component>
+                    <?endif?>
                     <Component Id='icon_file' Guid='*'>
                         <File
                             Id='icon0'
