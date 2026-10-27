@@ -3364,3 +3364,15 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
 - **验证**：`xime-config` schema_manager 4 passed；`xime-setup-lib --features voice-page`
   44 passed / 1 ignored；XimeYao `cargo test --workspace` 131 passed / 1 ignored；clippy 0。
 - **上游决定**：cangjie5 / luna_pinyin / essay.txt 属于 librime 内部默认方案，**不分发、不注入**；`builtin-extra/` 已删除，内置 seed 只保留 rime-wubi（19 个）。
+
+## 2026-10-27 托盘常驻 owner + F 键/回车修复
+
+- **托盘**：TSF 不再按焦点/每个实例直接 Show/Hide；server 记录 owner（TIP session id），
+  只有 owner 的 Hide 生效，Hide 延迟 1.5s 等短暂 Deactivate 被后续 Show 取消；
+  旧版 TSF 的 `session_id=0` 直接忽略，避免后台实例抢 owner。
+- **F 键**：`vk_to_xk` 没有 F1–F24 映射，会把 F2=0x71 当字母 q 吞掉；TSF 现在把
+  F1–F23 直接交还宿主，F24 保留内部 paste trigger（0x87）。
+- **自动识别回车**：数字后 Enter 走 `CommitDigits`，在当前回包提交，不再注入 Enter；
+  空闲 2.5s/失焦提交恢复（F24 映射修复）。
+- **验证**：F2 重命名/F5 刷新、123+Enter、123 等待/失焦上屏、Esc 放弃、语言栏切换
+  显隐全部实机通过；`cargo test --workspace` 131 passed / 1 ignored，clippy 0。

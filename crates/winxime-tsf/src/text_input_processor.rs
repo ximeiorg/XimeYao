@@ -310,8 +310,9 @@ impl IpcClientHandle {
         }
     }
 
-    pub fn show_tray_icon(&self) {
-        debug!("IPC::show_tray_icon() called");
+    /// 把当前 TIP 实例认领为托盘 owner（只在语言产品激活/激活时调用）。
+    pub fn show_tray_icon(&self, session_id: u32) {
+        debug!("IPC::show_tray_icon(session_id={session_id})");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -319,22 +320,16 @@ impl IpcClientHandle {
         if let Some(ref mut client) = guard.client {
             let request = IpcRequest {
                 command: IpcCommand::ShowTrayIcon,
-                session_id: 0,
+                session_id,
                 data: IpcRequestData::None,
             };
-            debug!("  -> sending ShowTrayIcon request");
-            if client.send_oneway(&request).is_ok() {
-                debug!("  -> ShowTrayIcon sent successfully");
-            } else {
-                debug!("  -> ShowTrayIcon send FAILED");
-            }
-        } else {
-            debug!("  -> no client");
+            let _ = client.send_oneway(&request);
         }
     }
 
-    pub fn hide_tray_icon(&self) {
-        debug!("IPC::hide_tray_icon() called");
+    /// 只有 owner 才会真正隐藏服务端托盘；非 owner 的调用由 server 忽略。
+    pub fn hide_tray_icon(&self, session_id: u32) {
+        debug!("IPC::hide_tray_icon(session_id={session_id})");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -342,17 +337,10 @@ impl IpcClientHandle {
         if let Some(ref mut client) = guard.client {
             let request = IpcRequest {
                 command: IpcCommand::HideTrayIcon,
-                session_id: 0,
+                session_id,
                 data: IpcRequestData::None,
             };
-            debug!("  -> sending HideTrayIcon request");
-            if client.send_oneway(&request).is_ok() {
-                debug!("  -> HideTrayIcon sent successfully");
-            } else {
-                debug!("  -> HideTrayIcon send FAILED");
-            }
-        } else {
-            debug!("  -> no client");
+            let _ = client.send_oneway(&request);
         }
     }
 
@@ -796,20 +784,6 @@ impl XimeEditSession_Impl {
 }
 
 impl XimeTextService_Impl {
-    fn show_tray_icon_guarded(&self) {
-        if !self.tray_visible.get() {
-            self.tray_visible.set(true);
-            self.ipc.show_tray_icon();
-        }
-    }
-
-    fn hide_tray_icon_guarded(&self) {
-        if self.tray_visible.get() {
-            self.tray_visible.set(false);
-            self.ipc.hide_tray_icon();
-        }
-    }
-
     fn is_composing(&self) -> bool {
         self.composing.get()
     }
@@ -1007,6 +981,14 @@ impl XimeTextService_Impl {
         }
 
         if code == VK_SHIFT.0 || code == VK_CONTROL.0 || code == VK_MENU.0 {
+            return false;
+        }
+
+        // F1–F23 永远不归输入法：直接交还宿主，避免 TSF 在“被 rime 拒绝”
+        // 路径上顺手收 composition，把 F2 重命名/F5 刷新吞掉。
+        // F24（0x87）是内部上屏触发键，不能在这里放行。
+        if is_function_passthrough(code) {
+            debug!("  -> function key, pass through to the app");
             return false;
         }
 
@@ -1329,7 +1311,6 @@ pub struct XimeTextService {
     last_input_key: std::cell::Cell<Option<char>>,
     ctrl_root_visible: std::cell::Cell<bool>,
     processing_focus: std::cell::Cell<bool>,
-    tray_visible: std::cell::Cell<bool>,
     /// Shift 单按判定：Shift 按下置位，期间任何其他键活动即清除；
     /// 抬起时仍置位才切换中英（Shift+符号键不触发切换）。
     shift_solo: std::cell::Cell<bool>,
@@ -1391,7 +1372,21 @@ fn vk_to_xk_shifted(vk: u16) -> Option<i32> {
 }
 
 /// vk_to_xk 的移位感知包装：shift 按下且键有移位字符时返回移位 keysym。
-fn vk_to_xk_with_shift(vk: u16, shift: bool) -> i32 {
+/// F1–F23 直接交还宿主；F24（0x87）是内部上屏触发键，必须留给 paste 协议。
+fn is_function_passthrough(vk: u16) -> bool {
+    (0x70..=0x86).contains(&vk)
+}
+
+fn vk_to_xk_with_shift(vk: u16, shift: bool) -> i32 {    // F24 是内部「上屏触发键」的协议键（VK_F24=0x87）。它必须保持 0x87，
+    // 否则 paste::request_commit() 的 F24 注入会被当成普通功能键，数字无法上屏。
+    if vk == 0x87 {
+        return 0x87;
+    }
+    // F1–F23 在 X11 里是 0xFFBE..=0xFFD4；librime 的 vk_to_xk 没有这些映射，
+    // 会退回 VK 数值（F2=0x71 变成字母 q），导致 F2/F5 被当成字母吞掉。
+    if (0x70..=0x86).contains(&vk) {
+        return 0xFFBE + (vk - 0x70) as i32;
+    }
     if shift {
         if let Some(shifted) = vk_to_xk_shifted(vk) {
             return shifted;
@@ -1454,7 +1449,6 @@ impl XimeTextService {
             last_input_key: std::cell::Cell::new(None),
             ctrl_root_visible: std::cell::Cell::new(false),
             processing_focus: std::cell::Cell::new(false),
-            tray_visible: std::cell::Cell::new(false),
             shift_solo: std::cell::Cell::new(false),
             test_keydown_pending: std::cell::Cell::new(false),
             test_keyup_pending: std::cell::Cell::new(false),
@@ -1519,7 +1513,6 @@ impl XimeTextService_Impl {
         match self.ensure_ipc() {
             Ok(()) => {
                 debug!("IPC connected successfully");
-                self.show_tray_icon_guarded();
             }
             Err(e) => debug!("IPC connection failed: {:?}", e),
         }
@@ -1632,7 +1625,7 @@ impl XimeTextService_Impl {
 
     fn deactivate_impl(&self) -> Result<()> {
         debug!("Deactivate called");
-        self.hide_tray_icon_guarded();
+        self.ipc.hide_tray_icon(self.client_id.get());
 
         // Unregister profile sink
         if self.profile_sink_cookie.get() != TF_INVALID_COOKIE {
@@ -1771,12 +1764,11 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
                     }
                 }
             }
-
-            self.show_tray_icon_guarded();
+            self.ipc.show_tray_icon(self.client_id.get());
         } else {
             debug!("  -> Our TIP is being deactivated");
             self.ipc.hide_candidates();
-            self.hide_tray_icon_guarded();
+            self.ipc.hide_tray_icon(self.client_id.get());
         }
 
         Ok(())
@@ -1785,14 +1777,17 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
 
 impl ITfThreadFocusSink_Impl for XimeTextService_Impl {
     fn OnSetThreadFocus(&self) -> Result<()> {
-        // Focus handling is done in ITfThreadMgrEventSink::OnSetFocus
-        debug!("ITfThreadFocusSink::OnSetThreadFocus - ignored");
+        // 线程获得焦点时才认领托盘 owner；FocusOut 不隐藏，避免同一个输入法
+        // 在 Chrome 输入框/页面之间点进点出时托盘闪。
+        if self.self_host.get() {
+            return Ok(());
+        }
+        self.ipc.show_tray_icon(self.client_id.get());
         Ok(())
     }
 
     fn OnKillThreadFocus(&self) -> Result<()> {
-        // Focus handling is done in ITfThreadMgrEventSink::OnSetFocus
-        debug!("ITfThreadFocusSink::OnKillThreadFocus - ignored");
+        // 不在这里隐藏：同一输入法在不同应用/控件间切焦点时应保持显示。
         Ok(())
     }
 }
@@ -1877,7 +1872,6 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
             if !commit_scheduled {
                 self.abort_composition();
             }
-            self.hide_tray_icon_guarded();
             self.processing_focus.set(false);
             return Ok(());
         }
@@ -1917,7 +1911,6 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
             }
         }
         self.ipc.focus_in();
-        self.show_tray_icon_guarded();
 
         self.processing_focus.set(false);
         Ok(())
@@ -1974,6 +1967,25 @@ mod tests {
         assert_eq!(vk_to_xk_with_shift(0x31, true), 0x21); // 1 → !
         assert_eq!(vk_to_xk_with_shift(0xBF, true), 0x3F); // / → ?
         assert_eq!(vk_to_xk_with_shift(0x30, true), 0x29); // 0 → )
+    }
+
+    /// F1–F24 必须映射到 X11 的 0xFFBE..=0xFFD5；否则 F2=0x71 会变成字母 q，
+    /// 被 rime 当输入吃掉（宿主收不到重命名/刷新）。
+    #[test]
+    fn function_keys_map_to_x11_range() {
+        assert_eq!(vk_to_xk_with_shift(0x70, false), 0xFFBE); // F1
+        assert_eq!(vk_to_xk_with_shift(0x71, false), 0xFFBF); // F2
+        assert_eq!(vk_to_xk_with_shift(0x74, false), 0xFFC2); // F5
+        assert_eq!(vk_to_xk_with_shift(0x87, false), 0x87); // F24 = paste trigger
+    }
+
+    /// F1–F23 永远交还宿主；F24 是内部 paste trigger，不能放行。
+    #[test]
+    fn function_keys_are_passthrough_except_f24() {
+        assert!(is_function_passthrough(0x70)); // F1
+        assert!(is_function_passthrough(0x71)); // F2
+        assert!(is_function_passthrough(0x86)); // F23
+        assert!(!is_function_passthrough(0x87)); // F24 = paste trigger
     }
 
     /// 计算器退出后宿主残留 composition 的对账规则。

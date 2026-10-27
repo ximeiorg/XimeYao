@@ -36,6 +36,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # rust-cache 偶尔会把 target/sherpa-onnx-prebuilt 恢复成“目录在、.lib 不在”
+      # 的残缺状态；sherpa-onnx-sys 的 build.rs 只看 lib 目录是否存在就跳过解压，
+      # 最后链接报 LNK1181: cannot open input file 'sherpa-onnx-c-api.lib'。
+      # 这里检查关键 lib，缺失就删掉解压目录和 build script 输出，强制重新解压
+      # 已缓存的归档（归档本身保留，不额外下载）。
+      - name: Repair cached sherpa-onnx prebuilt
+        shell: pwsh
+        run: |
+          $lib = "target\sherpa-onnx-prebuilt\sherpa-onnx-v1.13.8-win-x64-shared-MT-Release-lib\lib\sherpa-onnx-c-api.lib"
+          if (-not (Test-Path $lib)) {
+            Write-Host "sherpa prebuilt lib missing, forcing re-extract"
+            Get-ChildItem "target\sherpa-onnx-prebuilt" -Directory -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Get-ChildItem "target\release\build" -Directory -Filter "sherpa-onnx-sys-*" -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "sherpa prebuilt lib OK: $lib"
+          }
+
       - name: Build release
         run: cargo build --release --quiet
 

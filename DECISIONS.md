@@ -1307,3 +1307,17 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
 - cangjie5 / luna_pinyin / essay.txt 是 librime 内部默认方案，上游明确要求**完全屏蔽**，不作为内置 seed 分发或注入。
 - 因此 `builtin-extra/` 不进入仓库/安装包；`msix-bundle.ps1` 与 `msi-build.ps1` 只复制 rime-wubi。
 - `data/` 继续不分发；旧用户数据里已有的 cangjie/luna 文件留在本地方案，不主动删除。
+
+## 2026-10-27 托盘 owner 与 F 键/自动识别收尾
+
+- **托盘只由 server 持有，TIP 只上报 owner**：每个 TIP 实例带 session id；非 owner
+  的 Hide 忽略，避免后台实例的 Deactivate 藏掉前台图标。
+- **1.5s 延迟隐藏**：Chrome 输入框/页面切换会短暂 Deactivate→Activate，必须让
+  Show 取消 Hide；真正切到其他输入法产品才隐藏。
+- **旧 TSF 的 session_id=0 必须忽略**：宿主进程里已加载的旧 DLL 会把 owner 抢成 0，
+  导致新实例失去控制；兼容枚举位置保留命令，但服务端不再接受它的显隐。
+- **F1–F23 不进 rime**：`vk_to_xk` 的兜底会把 F2 当字母 q；直接交还宿主。
+  **F24 例外**：它是 `request_commit()` 的 paste trigger（0x87），不能被
+  F 键映射覆盖，否则空闲/失焦自动上屏失效。
+- **数字后 Enter 用当前回包提交**：不注入 Enter；注入路径既不稳又会误报
+  “该按键无法重放”。

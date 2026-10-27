@@ -133,7 +133,9 @@ pub enum IpcCommand {
     ClearComposition,
     ShutdownServer,
     ToggleAsciiMode,
+    /// 兼容旧版 TSF：服务端已不再根据它隐藏托盘，只做 no-op。
     ShowTrayIcon,
+    /// 兼容旧版 TSF：服务端已不再根据它隐藏托盘，只做 no-op。
     HideTrayIcon,
     HideCandidates,
     ReloadConfig,

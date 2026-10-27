@@ -587,6 +587,11 @@ enum ShadowAction {
     Backspace,
     Clear,
     Replay,
+    /// 回车：把数字直接提交，不再尝试注入当前键（注入 Enter 会触发
+    /// “该按键无法重放”的假失败通知）。
+    CommitDigits,
+    /// 功能键（F1–F24）：先提交数字，再把当前键交还宿主，不参与注入。
+    PassThrough,
 }
 
 fn classify_shadow_key(keysym: i32) -> ShadowAction {
@@ -606,6 +611,8 @@ fn classify_shadow_key(keysym: i32) -> ShadowAction {
         librime::key::XK_KP_MULTIPLY => ShadowAction::Operator('*'),
         librime::key::XK_KP_DIVIDE => ShadowAction::Operator('/'),
         librime::key::XK_EQUAL => ShadowAction::Finish,
+        XK_ENTER | 0xFF8D => ShadowAction::CommitDigits,
+        0xFFBE..=0xFFD5 => ShadowAction::PassThrough,
         XK_BACKSPACE => ShadowAction::Backspace,
         XK_ESC => ShadowAction::Clear,
         _ => ShadowAction::Replay,
@@ -773,6 +780,40 @@ pub fn handle_shadow_key(
             ActiveKeyOutcome::Handled(Box::new(close_response(
                 session_id, eng, context, window,
             )))
+        }
+        ShadowAction::CommitDigits => {
+            let digits = shadow.take().unwrap_or_default();
+            drop(shadow);
+            cancel_shadow_idle_commit();
+            tracing::info!("自动识别：回车提交 {} 字", digits.chars().count());
+            let mut response = close_response(session_id, eng, context, window);
+            if let Some(ctx) = response.context.as_mut() {
+                ctx.commit = if digits.is_empty() {
+                    None
+                } else {
+                    Some(digits)
+                };
+            }
+            ActiveKeyOutcome::Handled(Box::new(response))
+        }
+        ShadowAction::PassThrough => {
+            let digits = shadow.take().unwrap_or_default();
+            drop(shadow);
+            cancel_shadow_idle_commit();
+            *lock_anchor() = None;
+            WINDOW_SHOWN.store(false, Ordering::Relaxed);
+            *lock_selected() = 0;
+            context.update(|c| {
+                c.suggestion_state = None;
+                c.is_composing = false;
+                c.composition.preedit.clear();
+            });
+            window.hide();
+            if !digits.is_empty() && !crate::paste::request_commit(&digits) {
+                tracing::warn!("自动识别：功能键前的数字提交失败，已放行当前键");
+            }
+            // 当前键交给正常流程/宿主；F2、F5 等不能再被注入或用字母 keysym 吞掉。
+            ActiveKeyOutcome::Delegated
         }
         ShadowAction::Replay => {
             let digits = shadow.take().unwrap_or_default();
@@ -1560,6 +1601,11 @@ punctuator:
         // 字母/空格等非算式键走回放
         assert_eq!(classify_shadow_key(0x61), ShadowAction::Replay);
         assert_eq!(classify_shadow_key(0x20), ShadowAction::Replay);
+        // 回车直接提交数字；F1–F24 放行给宿主，不能注入。
+        assert_eq!(classify_shadow_key(XK_ENTER), ShadowAction::CommitDigits);
+        assert_eq!(classify_shadow_key(0xFF8D), ShadowAction::CommitDigits);
+        assert_eq!(classify_shadow_key(0xFFBE), ShadowAction::PassThrough);
+        assert_eq!(classify_shadow_key(0xFFC2), ShadowAction::PassThrough);
 
         // 影子起点：主键盘数字与小键盘数字都算；字母不算。
         assert!(is_shadow_starter(0x31));

@@ -134,7 +134,10 @@ pub struct TrayIcon;
 
 impl TrayIcon {
     /// 装上托盘图标：建隐藏窗口 + 弹菜单 + 加图标。
-    /// （返回 `()`，所以不叫 `new`——clippy 的 `new_ret_no_self` 说得对。）
+    ///
+    /// 托盘图标归 server 独占，但由**当前 owner TIP 实例**上报显隐：
+    /// 每个 TIP 实例带自己的 session id，只有 owner 的 Hide 生效，后台实例
+    /// 的 Deactivate 不会把前台图标藏掉。TSF 的焦点进出不参与显隐。
     pub fn install(on_action: Arc<dyn Fn(TrayAction) + Send + Sync>, switch_provider: SwitchProvider) {
         let hwnd = Self::create_window();
         let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
@@ -462,7 +465,7 @@ fn do_update_icon(is_ascii: bool) {
     }
 }
 
-/// 显示托盘图标（输入法激活时）
+/// 显示托盘图标（当前 owner TIP 激活时）。
 pub fn show_icon() {
     unsafe {
         if let Some(hwnd) = TRAY_HWND {
@@ -483,7 +486,7 @@ fn do_show_icon() {
     }
 }
 
-/// 隐藏托盘图标（切换到其他输入法时）
+/// 隐藏托盘图标（owner TIP 确认切到其他输入法产品时）。
 pub fn hide_icon() {
     unsafe {
         if let Some(hwnd) = TRAY_HWND {

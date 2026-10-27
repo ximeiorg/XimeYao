@@ -6,9 +6,9 @@ use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
 };
-use tracing::info;
+use tracing::{debug, info};
 use widestring::u16cstr;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
@@ -18,6 +18,83 @@ use winxime_ipc::{
 use xime_rime::RimeEngine;
 
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// X11 F1–F24 的 keysym 区间。功能键永远归宿主：IME 不消费 F2/F5。
+fn is_function_key(keycode: i32) -> bool {
+    (0xFFBE..=0xFFD5).contains(&keycode)
+}
+
+/// 当前拥有托盘图标的 TIP 实例（会话/线程 id）。`u32::MAX` = 没有 owner。
+///
+/// 托盘只有一个，但每个宿主进程/线程都会加载一份 TIP；如果每个实例都能直接
+/// Hide，后台实例的 Deactivate 就会把前台正在用的图标藏掉。只有 owner 的
+/// Hide 才生效，Show 会重新认领 owner。
+const TRAY_OWNER_NONE: u32 = u32::MAX;
+/// Chrome 里点进/点出输入框会短暂 `Deactivate` 再 `Activate`（实测约 0.8s）；
+/// 直接隐藏会闪。Hide 先等一会儿，期间任何 Show 都会取消它。
+const TRAY_HIDE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[derive(Clone, Copy)]
+struct TrayState {
+    owner: u32,
+    /// 每次 Show 自增；延迟 Hide 只有在自己拿到的 epoch 仍是当前值时才执行。
+    epoch: u64,
+}
+
+static TRAY_STATE: Mutex<TrayState> = Mutex::new(TrayState {
+    owner: TRAY_OWNER_NONE,
+    epoch: 0,
+});
+
+fn tray_claim(session_id: u32) {
+    // 旧版 TSF DLL 的 session_id 固定是 0；它可能仍被宿主进程映射着。
+    // 不能让它抢走新实例的 owner，否则旧进程一次 Show 就会把前台 owner 改成 0。
+    if session_id == 0 {
+        debug!("托盘 show: 忽略旧版 session_id=0");
+        return;
+    }
+    let mut state = TRAY_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.epoch = state.epoch.wrapping_add(1);
+    state.owner = session_id;
+    debug!(
+        "托盘 show: owner={session_id} epoch={}",
+        state.epoch
+    );
+    // 先改状态再投递 Show；Hide 线程拿同一把锁，不会把新 Show 又盖掉。
+    crate::tray::show_icon();
+}
+
+/// 延迟隐藏：Chrome 的短暂 Deactivate 会被后续 Show 取消；真正切到其他
+/// 输入法产品时没有后续 Show，1.5s 后才隐藏。
+fn tray_schedule_hide(session_id: u32) {
+    if session_id == 0 {
+        debug!("托盘 hide: 忽略旧版 session_id=0");
+        return;
+    }
+    let epoch = {
+        let state = TRAY_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.owner != session_id {
+            return;
+        }
+        state.epoch
+    };
+
+    std::thread::spawn(move || {
+        std::thread::sleep(TRAY_HIDE_DELAY);
+        let mut state = TRAY_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.owner == session_id && state.epoch == epoch {
+            state.owner = TRAY_OWNER_NONE;
+            debug!("托盘 hide: owner={session_id} epoch={epoch}");
+            crate::tray::hide_icon();
+        }
+    });
+}
 
 /// 候选栏翻页：UI 线程只做引擎锁 + 前后台切换，**不再走 F24 自注入**。
 /// 翻页不需要宿主跑编辑会话，直接改 server 的 rime 状态和候选窗即可；
@@ -563,6 +640,16 @@ fn handle_key_event(
                     };
                 }
             }
+        }
+    }
+
+    if let IpcRequestData::KeyEvent(key) = &request.data {
+        if is_function_key(key.keycode) {
+            // 不交给 rime：rime 会把未知 keysym 当字母/符号，F2 会变成 q。
+            return IpcResponse {
+                status: Some(get_ipc_status(eng)),
+                ..IpcResponse::fail(request.session_id)
+            };
         }
     }
 
@@ -1200,13 +1287,15 @@ fn process_request(
             }
         }
 
+        // 托盘归 server 独占；TIP 只上报「谁是当前 owner」，不再各自无限显隐。
+        // 非 owner 的 Hide 直接忽略，避免后台实例把前台图标藏掉。
         IpcCommand::ShowTrayIcon => {
-            crate::tray::show_icon();
+            tray_claim(request.session_id);
             IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::HideTrayIcon => {
-            crate::tray::hide_icon();
+            tray_schedule_hide(request.session_id);
             IpcResponse::ok(request.session_id)
         }
 
