@@ -31,6 +31,7 @@
 | 2026-11-09 | 清理过期构建与历史垃圾：`target` 24.8 GB → 33 MB | [2026-11-09-workspace-cleanup.md](docs/verify/2026-11-09-workspace-cleanup.md) |
 | 2026-11-09 | libximecore 拉至 `25aa1c8`（P2P 剪贴板、设置页）；Cargo.lock 解开 sha2/toml 版本冲突 | `git 25aa1c8` |
 | 2026-11-09 | 静态代码审计第一阶段：IPC 边界、压缩包解压、unsafe 分布 | [2026-11-09-code-audit.md](docs/2026-11-09-code-audit.md) |
+| 2026-11-09 | 修复计划落档；收尾本地提交 `1bf9913`、`b43a7da`（未 push） | [2026-11-09-remediation-plan.md](docs/2026-11-09-remediation-plan.md) |
 | 2026-10-29 | 版本 0.3.2；合并 upstream（删除 builtin-extra，不再分发 librime 默认方案） | `git 09ab350` |
 | 2026-10-27 | 托盘 owner 常驻、F1–F23 交还宿主、数字后回车提交 | `git eb9582a` |
 | 2026-10-27 | 内置方案 seed 管理、导入方案、删除下载包 | `git 7976083` |
