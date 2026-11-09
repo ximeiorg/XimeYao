@@ -9,7 +9,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use tracing::{debug, info};
-use widestring::u16cstr;
+use widestring::U16CString;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
 use winxime_ipc::{
@@ -149,6 +149,100 @@ pub fn request_page_from_ui(backward: bool) {
     }
 }
 
+/// 命名管道 DACL 的 SDDL：只放行「当前登录用户 + SYSTEM」。
+///
+/// 审计 F1：原描述符是 `D:(A;;GA;;;WD)`（Everyone，全部权限），本机任何进程都能
+/// 连进来发 `ShutdownServer`、再借 `ExportUserDict` 读写用户可写的任意文件；
+/// 多用户机器上别的会话也能连到同名管道。
+/// - `P`（protected DACL）：不让父对象把更宽的继承 ACE 带进来。
+/// - `SY`：保留 SYSTEM，系统维护/安全软件扫描走这个身份，去掉会让它们静默失联。
+///
+/// 拿不到当前用户 SID 时退 `OW`（对象所有者 = 建管道的用户）；**不退回 Everyone**。
+fn pipe_sddl(current_user_sid: Option<&str>) -> String {
+    match current_user_sid {
+        Some(sid) => format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)"),
+        None => "D:P(A;;GA;;;OW)(A;;GA;;;SY)".to_owned(),
+    }
+}
+
+/// 当前进程 token 的 user SID 文本形式（如 `S-1-5-21-…`）。
+fn current_user_sid_string() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PWSTR;
+
+    // SAFETY: 只读地取当前进程 token 与 SID。缓冲区按第一次
+    // GetTokenInformation 报出的长度分配，第二次写入不会越界；
+    // token 与 SID 字符串都在返回前释放。
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return None;
+        }
+        let mut required_len = 0u32;
+        // 第一次调用只为问长度，返回 ERROR_INSUFFICIENT_BUFFER 属预期。
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut required_len);
+        if required_len == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; required_len as usize];
+        let queried = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            required_len,
+            &mut required_len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !queried {
+            return None;
+        }
+        // TOKEN_USER 起始就是 SID_AND_ATTRIBUTES；SID 指针指向 buf 内部，
+        // 所以在 buf 存活期间使用。
+        let user = &*(buf.as_ptr().cast::<TOKEN_USER>());
+        let mut sid_text = PWSTR::null();
+        if ConvertSidToStringSidW(user.User.Sid, &mut sid_text).is_err() {
+            return None;
+        }
+        let text = sid_text.to_string().ok();
+        // ConvertSidToStringSidW 用 LocalAlloc 分配，必须 LocalFree。
+        let _ = LocalFree(Some(HLOCAL(sid_text.0.cast())));
+        text
+    }
+}
+
+/// 构筑管道安全描述符；失败时返回 `None`（调用方拒绝启动监听，不降级放行）。
+fn pipe_security_descriptor() -> Option<SecurityDescriptor> {
+    let sid = current_user_sid_string();
+    if sid.is_none() {
+        tracing::warn!("读取当前用户 SID 失败，管道 ACL 退回对象所有者（OW）");
+    }
+    let sddl = pipe_sddl(sid.as_deref());
+    let wide = match U16CString::from_str(&sddl) {
+        Ok(wide) => wide,
+        Err(e) => {
+            tracing::error!("管道 ACL 不是合法 UTF-16：{e}");
+            return None;
+        }
+    };
+    match SecurityDescriptor::deserialize(wide.as_ucstr()) {
+        Ok(sd) => {
+            tracing::info!("命名管道 ACL：{sddl}");
+            Some(sd)
+        }
+        Err(e) => {
+            tracing::error!("管道安全描述符无效（{sddl}）：{e}");
+            None
+        }
+    }
+}
+
 pub fn run_ipc_server(
     engine: Arc<std::sync::Mutex<RimeEngine>>,
     context: Arc<SharedInputContext>,
@@ -161,10 +255,12 @@ pub fn run_ipc_server(
     tracing::info!("Winxime Server: creating named pipe at {}", pipe_path);
     set_page_targets(&engine, &context, &window);
 
-    let sd = match SecurityDescriptor::deserialize(u16cstr!("D:(A;;GA;;;WD)")) {
-        Ok(sd) => sd,
-        Err(e) => {
-            tracing::error!("Failed to build security descriptor: {e}");
+    let sd = match pipe_security_descriptor() {
+        Some(sd) => sd,
+        None => {
+            // 宁可起不来也不退回 Everyone：输入法起不来是可见故障，
+            // 宽松 ACL 是无声的安全洞。
+            tracing::error!("命名管道 ACL 构筑失败，拒绝启动 IPC 监听");
             return;
         }
     };
@@ -1818,6 +1914,59 @@ fn get_ipc_context(eng: &RimeEngine, commit: &Option<String>) -> Option<winxime_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 审计 F1 的回归：ACL 只能是「当前用户 + SYSTEM」，绝不能再有 Everyone。
+    #[test]
+    fn pipe_sddl_grants_only_current_user_and_system() {
+        let sddl = pipe_sddl(Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(
+            sddl,
+            "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)",
+            "必须只放行当前用户与 SYSTEM，并加 P 屏蔽继承"
+        );
+        assert!(!sddl.contains(";WD)"), "不得出现 Everyone（WD）：{sddl}");
+        assert!(!sddl.contains(";;;BU)"), "不得放行 Builtin Users：{sddl}");
+    }
+
+    /// 取不到 SID 时的退路也必须是「对象所有者 + SYSTEM」，不能退回 Everyone。
+    #[test]
+    fn pipe_sddl_fallback_uses_owner_not_everyone() {
+        let sddl = pipe_sddl(None);
+        assert_eq!(sddl, "D:P(A;;GA;;;OW)(A;;GA;;;SY)");
+        assert!(!sddl.contains(";WD)"), "退路也不得出现 WD：{sddl}");
+    }
+
+    /// 两条 SDDL 都要能被 interprocess 解析；解析失败等于服务起不来。
+    #[test]
+    fn pipe_sddl_is_accepted_by_security_descriptor() {
+        for sddl in [
+            pipe_sddl(Some("S-1-5-21-1-2-3-1001")),
+            pipe_sddl(None),
+        ] {
+            let wide = U16CString::from_str(&sddl).expect("SDDL 是 ASCII");
+            assert!(
+                SecurityDescriptor::deserialize(wide.as_ucstr()).is_ok(),
+                "SDDL 解析失败：{sddl}"
+            );
+        }
+    }
+
+    /// 真实 token 上取 SID：本功能的前提，取不到就会退到 OW。
+    #[test]
+    fn current_user_sid_string_looks_like_a_sid() {
+        let sid = current_user_sid_string().expect("本机应能读到当前用户 SID");
+        assert!(sid.starts_with("S-1-"), "SID 文本形式不对：{sid}");
+        assert!(
+            !sid.chars().any(char::is_whitespace),
+            "SID 里不能有空白：{sid}"
+        );
+        let sddl = pipe_sddl(Some(&sid));
+        let wide = U16CString::from_str(&sddl).expect("SDDL 是 ASCII");
+        assert!(
+            SecurityDescriptor::deserialize(wide.as_ucstr()).is_ok(),
+            "真实 SID 的 SDDL 解析失败：{sddl}"
+        );
+    }
 
     #[test]
     fn parse_rime_selected_schema_reads_rime_record() {
