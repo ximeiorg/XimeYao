@@ -5,6 +5,7 @@ mod clipboard;
 mod config;
 mod context;
 mod custom_phrase;
+mod hashing;
 mod ipc_server;
 mod models;
 mod notify;

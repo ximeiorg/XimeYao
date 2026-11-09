@@ -12,7 +12,7 @@
 //! - `%APPDATA%\Xime\plugins\registry.yaml`
 //! - `%APPDATA%\Xime\plugins\config\<id>.yaml` 插件配置（host.config 存取）
 
-use std::io::{Cursor, Seek, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -20,6 +20,32 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 use xime_plugin::{PluginManager, PluginManifest, PluginRecordState, PluginRuntime, RemoteBackupEntry};
+
+use crate::hashing::sha256_hex;
+
+/// 备份恢复的硬上限（审计 F3）：备份包由远端插件提供，必须假设它可能是 zip 炸弹。
+/// 预扫描看中心目录声明的大小，解压时按**实际写入字节**再复核一遍（声明值可以撒谎）。
+const MAX_RESTORE_ENTRIES: usize = 20_000;
+const MAX_RESTORE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RESTORE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// 恢复限额。默认值即线上上限；单测注入小值跑「超限」分支，不必造两万个条目。
+#[derive(Clone, Copy)]
+struct RestoreLimits {
+    entries: usize,
+    total_bytes: u64,
+    file_bytes: u64,
+}
+
+impl Default for RestoreLimits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_RESTORE_ENTRIES,
+            total_bytes: MAX_RESTORE_TOTAL_BYTES,
+            file_bytes: MAX_RESTORE_FILE_BYTES,
+        }
+    }
+}
 
 /// 已启用插件的元数据快照（纯数据，可跨线程；运行时按需在调用线程内加载）。
 #[derive(Clone)]
@@ -176,42 +202,183 @@ impl PluginHost {
             .with_typed_runtime("backup", |runtime| runtime.pull_backup(id))
             .ok_or_else(|| "未安装已启用的 backup 类插件".to_string())?
             .ok_or_else(|| "远端备份不存在或拉取失败".to_string())?;
+        self.restore_archive(&bytes, RestoreLimits::default())
+    }
 
-        let mut archive =
-            zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("zip 打开失败: {}", e))?;
-        let mut restored = 0usize;
+    /// 恢复的实质部分，与插件拉取解耦，便于单测（审计 F3）。
+    ///
+    /// 四步：① 预扫描条目数与声明总大小；② 解压到 rime 目录**旁边**的临时目录，
+    /// 边写边复核实际字节（单文件 + 合计）；③ 全部落盘成功后才逐个 rename 覆盖目标，
+    /// 被覆盖的旧文件先挪进回滚目录；④ 任一步失败就回滚并清掉临时目录。
+    /// 这样坏包/超限包在碰用户数据之前就被拒绝，替换阶段出错也能把旧文件放回去。
+    fn restore_archive(&self, bytes: &[u8], limits: RestoreLimits) -> Result<usize, String> {
+        let staging = self.side_dir("restore");
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| format!("创建临时目录 {} 失败: {e}", staging.display()))?;
+        let staged = match self.extract_to_staging(bytes, &staging, limits) {
+            Ok(staged) => staged,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(e);
+            }
+        };
+        let applied = self.apply_staged(&staged);
+        if let Err(e) = std::fs::remove_dir_all(&staging) {
+            warn!("清理临时目录 {} 失败: {e}", staging.display());
+        }
+        match applied {
+            Ok(restored) => {
+                info!("备份恢复完成: {restored} 个文件");
+                Ok(restored)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 解压到暂存目录，返回 (暂存文件绝对路径, 相对 rime 目录的目标路径)。
+    /// 只在暂存目录里动，写不进去也不影响用户数据。
+    fn extract_to_staging(
+        &self,
+        bytes: &[u8],
+        staging: &Path,
+        limits: RestoreLimits,
+    ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|e| format!("zip 打开失败: {e}"))?;
+        if archive.len() > limits.entries {
+            return Err(format!(
+                "备份包含 {} 个条目，超过上限 {}",
+                archive.len(),
+                limits.entries
+            ));
+        }
+        let mut declared = 0u64;
+        for i in 0..archive.len() {
+            let entry = archive
+                .by_index(i)
+                .map_err(|e| format!("zip 条目读取失败: {e}"))?;
+            declared = declared.saturating_add(entry.size());
+            if declared > limits.total_bytes {
+                return Err(format!(
+                    "备份声明解压后超过上限 {} 字节",
+                    limits.total_bytes
+                ));
+            }
+        }
+
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(archive.len());
+        let mut total = 0u64;
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
-                .map_err(|e| format!("zip 条目读取失败: {}", e))?;
-            let Some(rel) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+                .map_err(|e| format!("zip 条目读取失败: {e}"))?;
+            let Some(rel) = entry.enclosed_name() else {
+                // 绝对路径、`..`、非法字符：跳过而不是报错，一个坏条目不该毁掉整包。
+                warn!("跳过包内非法路径条目: {}", entry.name());
                 continue;
             };
-            let rel_str = rel.to_string_lossy();
-            if rel_str.starts_with("_xime_backup/") || rel_str == "_xime_backup" {
+            // 包内路径在不同平台上可能是 `/` 或 `\`，按组件比而不是比字符串前缀。
+            let is_metadata = matches!(
+                rel.components().next(),
+                Some(std::path::Component::Normal(part)) if part == "_xime_backup"
+            );
+            if is_metadata {
                 continue;
             }
             // 去掉打包时的 rime/ 前缀
-            let target_rel = rel.strip_prefix("rime").unwrap_or(&rel);
+            let target_rel = rel.strip_prefix("rime").unwrap_or(&rel).to_path_buf();
             if target_rel.as_os_str().is_empty() {
                 continue;
             }
-            let dest = self.rime_dir.join(target_rel);
+            let staged_path = staging.join(&target_rel);
             if entry.is_dir() {
-                let _ = std::fs::create_dir_all(&dest);
+                std::fs::create_dir_all(&staged_path)
+                    .map_err(|e| format!("创建 {} 失败: {e}", staged_path.display()))?;
                 continue;
             }
-            if let Some(parent) = dest.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            if let Some(parent) = staged_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建 {} 失败: {e}", parent.display()))?;
             }
-            let mut out = std::fs::File::create(&dest)
-                .map_err(|e| format!("写入 {} 失败: {}", dest.display(), e))?;
-            std::io::copy(&mut entry, &mut out)
-                .map_err(|e| format!("解压 {} 失败: {}", dest.display(), e))?;
-            restored += 1;
+            let mut out = std::fs::File::create(&staged_path)
+                .map_err(|e| format!("写入 {} 失败: {e}", staged_path.display()))?;
+            copy_capped(&mut entry, &mut out, &mut total, limits)
+                .map_err(|e| format!("解压 {} 失败: {e}", target_rel.display()))?;
+            staged.push((staged_path, target_rel));
         }
-        info!("备份恢复完成: {} 个文件", restored);
-        Ok(restored)
+        if staged.is_empty() {
+            return Err("备份包里没有可恢复的文件".to_string());
+        }
+        Ok(staged)
+    }
+
+    /// 把暂存文件逐个落到 rime 目录；被覆盖的旧文件先挪进回滚目录，失败时整体倒回。
+    fn apply_staged(&self, staged: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
+        let rollback_root = self.side_dir("restore-old");
+        std::fs::create_dir_all(&rollback_root)
+            .map_err(|e| format!("创建回滚目录 {} 失败: {e}", rollback_root.display()))?;
+        let mut replaced: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut created: Vec<PathBuf> = Vec::new();
+        for (src, rel) in staged {
+            let dest = self.rime_dir.join(rel);
+            if let Some(parent) = dest.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    undo_apply(&replaced, &created);
+                    let _ = std::fs::remove_dir_all(&rollback_root);
+                    return Err(format!("创建目录 {} 失败: {e}", parent.display()));
+                }
+            }
+            if dest.exists() {
+                let old = rollback_root.join(rel);
+                if let Some(parent) = old.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        undo_apply(&replaced, &created);
+                        let _ = std::fs::remove_dir_all(&rollback_root);
+                        return Err(format!("创建回滚目录 {} 失败: {e}", parent.display()));
+                    }
+                }
+                if let Err(e) = std::fs::rename(&dest, &old) {
+                    undo_apply(&replaced, &created);
+                    let _ = std::fs::remove_dir_all(&rollback_root);
+                    return Err(format!("暂存原文件 {} 失败: {e}", dest.display()));
+                }
+                replaced.push((dest.clone(), old));
+            } else {
+                created.push(dest.clone());
+            }
+            if let Err(e) = std::fs::rename(src, &dest) {
+                undo_apply(&replaced, &created);
+                let _ = std::fs::remove_dir_all(&rollback_root);
+                return Err(format!("写入 {} 失败: {e}", dest.display()));
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(&rollback_root) {
+            // 恢复本身成功；旧文件留在磁盘上只是垃圾，不该让整次恢复失败。
+            warn!("清理回滚目录 {} 失败: {e}", rollback_root.display());
+        }
+        Ok(staged.len())
+    }
+
+    /// rime 目录旁边的临时目录名（同一卷，rename 才可能是原子的）。
+    fn side_dir(&self, tag: &str) -> PathBuf {
+        let base = self
+            .rime_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.rime_dir.clone());
+        let pid = std::process::id();
+        let mut n = 0u32;
+        loop {
+            let dir = base.join(format!(".xime-{tag}-{pid}-{n}"));
+            if !dir.exists() {
+                return dir;
+            }
+            n = n.saturating_add(1);
+            if n >= 1000 {
+                // 冲突到这个程度就交给 create_dir_all 报错，别无限转。
+                return dir;
+            }
+        }
     }
 
     /// 删除远端备份条目。
@@ -601,11 +768,57 @@ fn install_bundled(manager: &PluginManager, bundled_dir: &Path) {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+/// 带双重上限的流式拷贝：单文件上限挡大文件，合计上限挡「很多中等文件」的炸弹。
+///
+/// `total` 失败时已计入部分字节——调用方随后整体丢弃暂存目录，不需要精确值。
+fn copy_capped<R: Read, W: Write>(
+    src: &mut R,
+    dst: &mut W,
+    total: &mut u64,
+    limits: RestoreLimits,
+) -> Result<(), String> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut file_bytes = 0u64;
+    loop {
+        let n = src.read(&mut buf).map_err(|e| format!("读取失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let n = n as u64;
+        file_bytes = file_bytes.saturating_add(n);
+        *total = total.saturating_add(n);
+        if file_bytes > limits.file_bytes {
+            return Err(format!("单文件超过上限 {} 字节", limits.file_bytes));
+        }
+        if *total > limits.total_bytes {
+            return Err(format!("解压合计超过上限 {} 字节", limits.total_bytes));
+        }
+        let n = usize::try_from(n).map_err(|_| "块长度溢出".to_string())?;
+        dst.write_all(&buf[..n])
+            .map_err(|e| format!("写出失败: {e}"))?;
+    }
+    dst.flush().map_err(|e| format!("写出失败: {e}"))
+}
+
+/// 把 `apply_staged` 已做的改动倒回去：新写入的删掉、被挪走的旧文件挪回原位。
+///
+/// 尽力而为：回滚时的错误只能记日志，真正要报给用户的是最初那个失败原因。
+fn undo_apply(replaced: &[(PathBuf, PathBuf)], created: &[PathBuf]) {
+    for dest in created.iter().rev() {
+        if let Err(e) = std::fs::remove_file(dest) {
+            warn!("回滚删除 {} 失败: {e}", dest.display());
+        }
+    }
+    for (dest, old) in replaced.iter().rev() {
+        let _ = std::fs::remove_file(dest);
+        if let Err(e) = std::fs::rename(old, dest) {
+            warn!(
+                "回滚还原 {} 失败: {e}（原文件在 {}）",
+                dest.display(),
+                old.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -749,8 +962,175 @@ plugin_id = \"test.clip\"
         let labels: Vec<&str> = fields.iter().map(|f| f.label.as_str()).collect();
         assert!(
             labels.contains(&"WebDAV 服务器"),
-            "schema 标签异常: {labels:?}"
-        );
+            "schema 标签异常: {labels:?}"        );
         assert!(labels.contains(&"密码"), "schema 标签异常: {labels:?}");
     }
+
+    /// 造一个内存 zip：条目按给定顺序写入（恢复顺序 = 包内顺序）。
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            zip.start_file(*name, options).unwrap_or_default();
+            zip.write_all(data).unwrap_or_default();
+        }
+        zip.finish()
+            .map(|c| c.into_inner())
+            .unwrap_or_default()
+    }
+
+    /// 恢复后：正常文件落位、`_xime_backup/` 元数据跳过、无关文件不动、临时目录清干净。
+    #[test]
+    fn restore_archive_writes_files_and_skips_metadata() {
+        let root = temp_root("restore_ok");
+        let rime = root.join("rime");
+        std::fs::write(rime.join("untouched.yaml"), "keep").unwrap_or_default();
+        let host = PluginHost::new(rime.clone(), None);
+        let bytes = zip_bytes(&[
+            ("rime/default.yaml", b"name: new"),
+            ("_xime_backup/meta.json", b"{}"),
+        ]);
+        let restored = host
+            .restore_archive(&bytes, RestoreLimits::default())
+            .unwrap_or_else(|e| panic!("恢复应成功: {e}"));
+        assert_eq!(restored, 1, "元数据条目不计入文件数");
+        assert_eq!(
+            std::fs::read_to_string(rime.join("default.yaml")).unwrap_or_default(),
+            "name: new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rime.join("untouched.yaml")).unwrap_or_default(),
+            "keep",
+            "包里没有的文件必须原样保留"
+        );
+        assert!(!root.join("_xime_backup").exists(), "元数据不能落到 rime 目录");
+        assert!(leftover_side_dirs(&root).is_empty(), "临时目录要清掉");
+    }
+
+    /// 条目数超限：整包拒绝，且一条都不落盘。
+    #[test]
+    fn restore_rejects_archive_over_entry_limit() {
+        let root = temp_root("restore_entries");
+        let rime = root.join("rime");
+        let host = PluginHost::new(rime.clone(), None);
+        let bytes = zip_bytes(&[("rime/a.yaml", b"a"), ("rime/b.yaml", b"b")]);
+        let limits = RestoreLimits {
+            entries: 1,
+            ..RestoreLimits::default()
+        };
+        let err = host
+            .restore_archive(&bytes, limits)
+            .expect_err("超限必须拒绝");
+        assert!(err.contains("超过上限"), "错误要说清原因: {err}");
+        assert!(!rime.join("a.yaml").exists(), "拒绝时不能落盘");
+        assert!(leftover_side_dirs(&root).is_empty(), "临时目录要清掉");
+    }
+
+    /// 声明总大小超限：预扫描就拒绝，不进解压阶段。
+    #[test]
+    fn restore_rejects_archive_over_total_bytes() {
+        let root = temp_root("restore_total");
+        let rime = root.join("rime");
+        let host = PluginHost::new(rime.clone(), None);
+        let bytes = zip_bytes(&[("rime/big.yaml", &[b'x'; 64][..])]);
+        let limits = RestoreLimits {
+            total_bytes: 8,
+            ..RestoreLimits::default()
+        };
+        let err = host
+            .restore_archive(&bytes, limits)
+            .expect_err("超限必须拒绝");
+        assert!(err.contains("超过上限"), "错误要说清原因: {err}");
+        assert!(!rime.join("big.yaml").exists(), "拒绝时不能落盘");
+    }
+
+    /// 单文件超限：解压阶段按实际字节拦下（中心目录的声明值可以撒谎）。
+    #[test]
+    fn restore_rejects_single_file_over_limit() {
+        let root = temp_root("restore_file");
+        let rime = root.join("rime");
+        let host = PluginHost::new(rime.clone(), None);
+        let bytes = zip_bytes(&[("rime/big.yaml", &[b'x'; 64][..])]);
+        let limits = RestoreLimits {
+            file_bytes: 8,
+            total_bytes: 1024,
+            ..RestoreLimits::default()
+        };
+        let err = host
+            .restore_archive(&bytes, limits)
+            .expect_err("超限必须拒绝");
+        assert!(err.contains("上限"), "错误要说清原因: {err}");
+        assert!(!rime.join("big.yaml").exists(), "拒绝时不能落盘");
+        assert!(leftover_side_dirs(&root).is_empty(), "临时目录要清掉");
+    }
+
+    /// 只有元数据、没有可恢复文件的包：报错而不是「成功恢复 0 个」。
+    #[test]
+    fn restore_rejects_archive_without_files() {
+        let root = temp_root("restore_empty");
+        let host = PluginHost::new(root.join("rime"), None);
+        let bytes = zip_bytes(&[("_xime_backup/meta.json", b"{}")]);
+        let err = host
+            .restore_archive(&bytes, RestoreLimits::default())
+            .expect_err("空包必须报错");
+        assert!(err.contains("没有可恢复的文件"), "错误要说清原因: {err}");
+    }
+
+    /// 路径穿越条目要跳过，不能写到 rime 目录外面。
+    #[test]
+    fn restore_skips_path_traversal_entries() {
+        let root = temp_root("restore_traversal");
+        let rime = root.join("rime");
+        let host = PluginHost::new(rime.clone(), None);
+        let bytes = zip_bytes(&[("rime/ok.yaml", b"ok"), ("../evil.txt", b"bad")]);
+        let restored = host
+            .restore_archive(&bytes, RestoreLimits::default())
+            .unwrap_or_else(|e| panic!("合法条目应恢复: {e}"));
+        assert_eq!(restored, 1);
+        assert!(rime.join("ok.yaml").exists());
+        assert!(!root.join("evil.txt").exists(), "越界条目不能落盘");
+    }
+
+    /// 替换阶段失败要回滚：先换上的文件必须恢复成旧内容。
+    ///
+    /// 构造：`rime/x` 是个文件，而包里要求写 `rime/x/y.txt`，`create_dir_all` 必然失败；
+    /// 包内顺序让 `z.txt` 先被替换，正好考验回滚。
+    #[test]
+    fn restore_failure_rolls_back_replaced_files() {
+        let root = temp_root("restore_rollback");
+        let rime = root.join("rime");
+        std::fs::write(rime.join("z.txt"), "old-z").unwrap_or_default();
+        std::fs::write(rime.join("x"), "blocker").unwrap_or_default();
+        let host = PluginHost::new(rime.clone(), None);
+        let bytes = zip_bytes(&[("rime/z.txt", b"new-z"), ("rime/x/y.txt", b"child")]);
+        let err = host
+            .restore_archive(&bytes, RestoreLimits::default())
+            .expect_err("目标目录被占必须失败");
+        assert!(err.contains("创建目录"), "错误要说清原因: {err}");
+        assert_eq!(
+            std::fs::read_to_string(rime.join("z.txt")).unwrap_or_default(),
+            "old-z",
+            "已替换的文件要回滚成旧内容"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rime.join("x")).unwrap_or_default(),
+            "blocker",
+            "占位文件不能被改动"
+        );
+        assert!(!rime.join("x").is_dir());
+        assert!(leftover_side_dirs(&root).is_empty(), "临时目录要清掉");
+    }
+
+    /// 暂存/回滚目录都建在 rime 目录同级，测试里按前缀找残留。
+    fn leftover_side_dirs(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".xime-restore"))
+            .collect()
+    }
 }
+
