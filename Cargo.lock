@@ -6882,7 +6882,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-ipc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "interprocess",
  "serde",
@@ -6892,7 +6892,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "bzip2-rs",
@@ -6924,7 +6924,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-setup"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "tracing",
  "windows 0.62.2",
@@ -6937,7 +6937,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-tsf"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "librime",
@@ -6951,7 +6951,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-tsf-register"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",

@@ -1,5 +1,18 @@
 # 曦码·曜 (Xime Yao) 五笔输入法 - 架构决策
 
+> 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
+> 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
+
+## D-001 采用「规则文件 + 机检」治理仓库
+
+- 日期：2026-11-09
+- 状态：生效
+- 背景：仓库只有 AGENTS 与 PROGRESS/DECISIONS，PROGRESS 3378 行把状态与历史混在一起，DECISIONS 无编号与状态字段，规则无法机检。分析见 [yanshu 规则借鉴](docs/2026-11-09-yanshu-rules-borrowing.md)。
+- 决策：规则拆五文件（AGENTS / WORKFLOW / RULES / VISUAL / TEAM）；PROGRESS ≤150 行；新决策用 `D-nnn`；验证证据落 `docs/verify/`；`scripts/doccheck.mjs` 与 `scripts/refcheck.mjs` 双机检；CI 增加 `docs` job。
+- 理由：文档漂移与「自述完成」是本项目两类高发问题，可判定的部分交给脚本比每次通读三千行可靠。yanshu 的经验是 e2e 700+ 全绿仍漏 9 项界面缺陷，故 VISUAL 单独列肉眼复核项。
+- 影响与代价：后续会话的打卡、提交、验收走新流程；旧 PROGRESS 原文整档迁 `docs/verify/completed-legacy-progress.md`；旧 DECISIONS 条目不溯改；每次提交多花一次机检。
+- 遗留：test/clippy 尚未进 CI（待评估构建时长）；历史验证证据未逐条回填；规则首次实战后按 `RULES.md §4` 复审一次。
+
 ## 2026-05-06 Workspace 架构决策
 
 ### 决策

@@ -1,45 +1,54 @@
-# 曦码·曜 (Xime Yao) 五笔输入法 - Windows 版本
+# 曦码·曜 (Xime Yao) 五笔输入法 - Windows 版
 
-## 项目简介
-这是一个基于 rime 框架实现的Windows 五笔输入法，采用 Rust + TSF 构建。
+## §1 项目简介
 
-## 快速开始
-- 开发构建： `.\rebuild.ps1` (管理员 PowerShell 运行：构建发布版 + 按安装布局暂存 + MSIX 开发注册 + 从注册的包目录启动服务器，与真实安装效果一致、无控制台窗口)
-- 打包 MSI： `.\msi-build.ps1` (生成安装包，版本号自动从 Cargo.toml 读取)
-- 完全卸载： `.\full-uninstall.ps1` (删除所有文件+注册表+用户数据)
+基于 rime 框架的 Windows 五笔输入法：Rust + TSF，workspace 含 5 个 crate，librime 为子模块。许可 GPL-3.0-or-later。
 
-## MSI 构建
-- 构建 MSI： `.\msi-build.ps1`
-- 输出文件： `target\wix\ximeyao-{version}-x86_64.msi`
-- 安装测试： `msiexec /i target\wix\ximeyao-{version}-x86_64.msi`
-- 版本号： 自动从 `Cargo.toml` 的 `workspace.package.version` 读取
+## §2 文件地图
 
-## 硬性规则（必须遵守，CI 会验证）
-- 所有命令使用 powershell
-- 修改完必须使用 `cargo build --quiet` 检查是否有错误；收尾再跑
-  `cargo clippy --workspace --all-targets`（0 warning）与 `cargo test --workspace`
-- 代码中禁止出现`unwarp()` 和 `expect()` 方法（`unwarp` 为原文笔误，实指 `unwrap`）
-- 禁止自己运行程序，禁止自己安装
-- **librime 源码只读**：不修改 `libximecore/librime` 里任何被跟踪文件。
-  唯一例外是**构建输入**：插件按上游约定放在 `librime/plugins/<name>`（我们用目录联接
-  指向仓库外的 clone，见 README「前置要求」）；`librime/build`、`librime/dist` 本就是
-  构建产物。用完可 `rmdir` 联接回退。
-- 未经用户明确指示，**不要 commit / push**（下班打卡第 3 步只在用户要求时执行）
+| 文件 | 用途 | 上限（行） |
+| --- | --- | --- |
+| AGENTS.md | 入口：底线、红线、地图 | 90 |
+| WORKFLOW.md | 打卡、质量门、证据、三档、PROGRESS/DECISIONS 写法 | 130 |
+| RULES.md | 规则写法、引用、机检 | 80 |
+| VISUAL.md | 候选栏/托盘/设置页视觉纪律 | 50 |
+| TEAM.md | 多人协作与复核 | 90 |
+| PROGRESS.md | 当前状态/已完成/未决/验证记录/下一步 | 150 |
+| DECISIONS.md | D-nnn 决策记录 | 单条 50 |
+| docs/verify/ | 验证证据与历史归档 | 不限 |
 
-## 工作规则
-- 每次只做一个功能点
-- 当前功能点端到端验证通过后，才能开始下一个
-- 不要在实现功能 A 时"顺便"重构功能 B
-- 当觉得有必要时，就添加单元测试
-- 普通用户可见处的信息文字等应通俗优雅化，用户便于理解。
+## §3 硬性规则（违反即失败）
 
-## 每次会话开始时（上班打卡）
-1. 读 PROGRESS.md 了解当前状态
-2. 读 DECISIONS.md 了解重要决策
-3. 跑 `./cargo build --quiet` 确认仓库处于一致状态
-4. 从 PROGRESS.md 的"下一步"部分继续工作
+- 所有命令用 PowerShell。
+- 改完跑 `cargo build --quiet`；收尾跑 `cargo clippy --workspace --all-targets`（0 warning）与 `cargo test --workspace`。
+- 代码禁 `unwrap()` / `expect()`；错误必须显式处理。
+- 禁止自己运行程序、禁止自己安装；实机验证交给用户，我只给步骤与预期。
+- `libximecore/librime` 只读；唯一例外是构建输入（插件目录联接、build/dist 产物）。
+- 未经用户明确指示，不 commit / push。
+- 文档改动跑 `node scripts/doccheck.mjs` 与 `node scripts/refcheck.mjs`，双绿才提交。
 
-## 每次会话结束前（下班打卡）
-1. 更新 PROGRESS.md（本次做了什么、验证数据、遗留项）
-2. 跑 `cargo build --quiet` 确认一致状态（必要时再跑 clippy / test）
-3. 与用户确认后再提交（默认不自行 commit / push）
+## §4 工作规则
+
+- 一次只做一个功能点；端到端验证通过再开下一个。
+- 不做功能 A 时顺手重构 B；要重构先写 `D-nnn`。
+- 需要时补单元测试；修 bug 必须带回归用例或可复现步骤。
+- 用户可见文案说清「发生了什么 / 为什么 / 下一步能做什么」，禁止只写「操作失败」。
+- 事实优先级（高→低）：产品事实（代码/实测/用户确认）> `D-nnn` > 一手实测记录 > 上游规范 > 对标项目实测 > 第三方文档 > 模型记忆；记忆不得单独作依据，不确定就写「未验证」。
+
+## §5 打卡
+
+- 上班：读 `PROGRESS.md` 与 `DECISIONS.md` 最近 3 条 → `git status --short` → `cargo build --quiet` → 从「下一步」继续；先写一句 S0（目标 + 验收）。
+- 下班：更新 PROGRESS 与 `docs/verify/` → build（必要时 clippy/test）→ 双机检 → 汇报 → 用户同意后提交。细则见 `WORKFLOW.md §1`、`WORKFLOW.md §7`。
+
+## §6 常用命令
+
+- 开发构建：`.\rebuild.ps1`（管理员；构建 + 按安装布局暂存 + MSIX 开发注册 + 启动 server）
+- 打包 MSI：`.\msi-build.ps1` → `target\wix\ximeyao-{version}-x86_64.msi`
+- 安装测试：`msiexec /i target\wix\ximeyao-{version}-x86_64.msi`
+- 完全卸载：`.\full-uninstall.ps1`
+- 版本号：`Cargo.toml` 的 `workspace.package.version`，打包脚本自动读取
+
+## §7 临时产物
+
+- 一次性脚本、日志、截图放 `target/tmp/`，用完清理；仓库根目录不留临时文件。
+- 机检与打包产生的中间文件不得加入版本库。

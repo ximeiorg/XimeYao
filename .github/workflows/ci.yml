@@ -200,3 +200,16 @@ jobs:
         with:
           name: MSIX Package
           path: target/wix/ximeyao-*.msix
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: doccheck
+        run: node scripts/doccheck.mjs
+      - name: refcheck
+        run: node scripts/refcheck.mjs
