@@ -9,7 +9,7 @@
 | 同上 | `cargo test --workspace` | `1 passed` / `131 passed; 1 ignored` / `6 passed`；合计 138 passed、1 ignored、0 failed，退出码 0（日志 `target/tmp/test-baseline.log`） | 单元测试 |
 | Node v24.22.1 | `node scripts/doccheck.mjs` | `doccheck: 通过`，exit 0；负面测试：临时注入行号引用后 exit 1，还原后通过 | 文档结构 |
 | Node v24.22.1 | `node scripts/refcheck.mjs` | `refcheck: 通过（9 个文件）`，exit 0 | 引用锚点 |
-| GitHub Actions | `docs` job（ubuntu-latest / node 20） | 未跑（待 push 或 PR） | CI 文档门禁 |
+| GitHub Actions | `docs` job（ubuntu-latest / node 20） | push `763df7a` 触发，`Docs: success`；`Build` job 未跟进（用户指示暂不处理） | CI 文档门禁 |
 
 - 未验证：MSI/MSIX 打包、实机安装与输入法行为未在本轮复跑。
 - 肉眼复核：本轮无 UI 改动，不适用。
