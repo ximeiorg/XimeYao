@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 use xime_plugin::{PluginManager, PluginManifest, PluginRecordState, PluginRuntime, RemoteBackupEntry};
+use xime_p2p::Event;
 
+use crate::clipboard_p2p::{p2p_dir_for, P2pSync};
 use crate::hashing::sha256_hex;
 
 /// 备份恢复的硬上限（审计 F3）：备份包由远端插件提供，必须假设它可能是 zip 炸弹。
@@ -450,7 +452,8 @@ impl PluginHost {
     /// 当前是否选中了可用的剪贴板同步插件（目前只有单测在用）。
     #[cfg(test)]
     pub fn has_clipboard_sync(&self) -> bool {
-        self.resolve_clipboard_plugin().is_some()
+        let selection = self.clipboard_selection();
+        self.resolve_clipboard_plugin(&selection).is_some()
     }
 
     /// 重新扫描插件并对齐剪贴板工作线程状态（设置程序启停/选择插件后经 IPC 触发）。
@@ -479,10 +482,16 @@ impl PluginHost {
     /// 选型来源 clipboard_sync.toml（设置程序写入，与 Android daemon 契约一致）：
     /// enabled=false 或无候选 → None；plugin_id 为空时回退第一个已启用的
     /// clipboard_sync 插件。
-    fn resolve_clipboard_plugin(&self) -> Option<EnabledPlugin> {
+    fn clipboard_selection(&self) -> ClipboardSyncSelection {
         let root = self.rime_dir.parent().unwrap_or_else(|| Path::new("."));
-        let selection = read_clipboard_sync_selection(root);
-        if !selection.enabled {
+        read_clipboard_sync_selection(root)
+    }
+
+    fn resolve_clipboard_plugin(
+        &self,
+        selection: &ClipboardSyncSelection,
+    ) -> Option<EnabledPlugin> {
+        if !selection.wants_plugin() {
             return None;
         }
         let enabled = self.enabled.lock().unwrap_or_else(|e| e.into_inner());
@@ -539,16 +548,21 @@ impl PluginHost {
     }
 
     /// 依据 clipboard_sync.toml 选型对齐剪贴板工作线程：
-    /// 线程常驻（剪贴板历史记录不依赖同步插件）；仅在选型变更时停旧起新。
+    /// 线程常驻（剪贴板历史记录不依赖同步通道）；仅在选型变更时停旧起新。
     fn sync_clipboard_worker(self: &Arc<Self>) {
-        let desired = self.resolve_clipboard_plugin().map(|p| p.id);
+        let selection = self.clipboard_selection();
+        let plugin_id = self
+            .resolve_clipboard_plugin(&selection)
+            .map(|p| p.id)
+            .unwrap_or_default();
+        let desired = worker_key(&plugin_id, selection.wants_p2p());
         let started = self.worker_started.load(Ordering::Acquire);
         let current = self
             .clipboard_plugin
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if started && current == desired {
+        if started && current.as_deref() == Some(desired.as_str()) {
             return;
         }
         if started {
@@ -560,13 +574,16 @@ impl PluginHost {
         self.start_clipboard_worker();
     }
 
-    /// 启动剪贴板工作线程（常驻；按选型持有可选的同步插件运行时）。
+    /// 启动剪贴板工作线程（常驻；按选型持有可选的同步插件运行时与 P2P 节点）。
     fn start_clipboard_worker(self: &Arc<Self>) {
-        let plugin = self.resolve_clipboard_plugin();
-        let plugin_id = plugin.as_ref().map(|p| p.id.clone());
+        let selection = self.clipboard_selection();
+        let plugin = self.resolve_clipboard_plugin(&selection);
+        let plugin_id = plugin.as_ref().map(|p| p.id.clone()).unwrap_or_default();
+        let p2p_dir = selection.wants_p2p().then(|| p2p_dir_for(&self.rime_dir));
+        let key = worker_key(&plugin_id, p2p_dir.is_some());
         let db_path = xime_config::clipboard_store::default_db_path();
         let (tx, rx) = mpsc::channel::<ClipboardCommand>();
-        std::thread::spawn(move || run_clipboard_worker(plugin, db_path, rx));
+        std::thread::spawn(move || run_clipboard_worker(plugin, p2p_dir, db_path, rx));
         *self
             .clipboard_tx
             .lock()
@@ -574,16 +591,24 @@ impl PluginHost {
         *self
             .clipboard_plugin
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = plugin_id;
+            .unwrap_or_else(|e| e.into_inner()) = Some(key);
         self.worker_started.store(true, Ordering::Release);
     }
 }
 
-/// 剪贴板工作线程（常驻）：始终记录剪贴板历史；持有 clipboard_sync 插件
-/// 运行时（若启用）时才执行推送/拉取。
+/// 工作线程的「选型键」：插件 id + 是否走局域网直连。
+///
+/// 任一项变化都要重建线程——插件运行时和 P2P 节点都归那个线程独占。
+fn worker_key(plugin_id: &str, p2p: bool) -> String {
+    format!("{plugin_id}|{}", if p2p { "p2p" } else { "" })
+}
+
+/// 剪贴板工作线程（常驻）：始终记录剪贴板历史；按选型持有同步插件运行时
+/// 和/或局域网直连节点。
 /// 三通道去重状态（当前内容 / 上次推送 / 自写回显）归本线程所有，无需加锁。
 fn run_clipboard_worker(
     plugin: Option<EnabledPlugin>,
+    p2p_dir: Option<PathBuf>,
     db_path: PathBuf,
     rx: mpsc::Receiver<ClipboardCommand>,
 ) {
@@ -607,10 +632,20 @@ fn run_clipboard_worker(
         }
     });
 
+    // 局域网直连节点也归本线程：Node 自带后台运行时，这里只做投递与轮询。
+    let p2p = p2p_dir.and_then(|dir| match P2pSync::start(&dir) {
+        Ok(sync) => Some(sync),
+        Err(e) => {
+            warn!("局域网直连未启动（{}）：{}", dir.display(), e);
+            None
+        }
+    });
+
     info!(
-        "剪贴板工作线程已启动: db={} 同步插件={}",
+        "剪贴板工作线程已启动: db={} 同步插件={} 局域网直连={}",
         db_path.display(),
-        if plugin_id.is_empty() { "未启用" } else { &plugin_id }
+        if plugin_id.is_empty() { "未启用" } else { &plugin_id },
+        if p2p.is_some() { "已启用" } else { "未启用" }
     );
     let mut current: Option<String> = None;
     let mut last_pushed: Option<String> = None;
@@ -629,6 +664,11 @@ fn run_clipboard_worker(
                 current = Some(hash.clone());
                 // 历史持久化（SQLite，与 Android clipboard.db 同构；超长截断）
                 record_history(&db_path, &text);
+                if let Some(sync) = &p2p {
+                    if sync.push_text(&text) {
+                        info!("局域网直连已投递 ({} 字符)", text.chars().count());
+                    }
+                }
                 let profile = serde_json::json!({
                     "type": "text",
                     "hash": hash,
@@ -652,6 +692,11 @@ fn run_clipboard_worker(
                 }
             }
             ClipboardCommand::PollTick => {
+                if let Some(sync) = &p2p {
+                    while let Some(event) = sync.poll() {
+                        handle_p2p_event(event, &db_path, &mut current, &mut self_written);
+                    }
+                }
                 let Some(runtime) = &runtime else {
                     continue; // 未启用同步插件，无事可拉
                 };
@@ -705,6 +750,60 @@ fn run_clipboard_worker(
     }
 }
 
+/// 处理一条局域网直连事件：远端文本入历史并写回系统剪贴板。
+///
+/// 去重沿用工作线程的三态：`current` 挡「本地刚复制过的同一内容」，
+/// `self_written` 挡「自己刚推出去、又被对端转回来的回声」。
+fn handle_p2p_event(
+    event: Event,
+    db_path: &Path,
+    current: &mut Option<String>,
+    self_written: &mut Option<String>,
+) {
+    match event {
+        Event::Clipboard(profile) => {
+            if profile.has_data {
+                info!("远端剪贴板为图片附件，桌面端暂未支持图片同步，跳过");
+                return;
+            }
+            if profile.text.is_empty() {
+                return;
+            }
+            let text = profile.text;
+            // hash 留空（旧版纯文本）时由宿主补算
+            let hash = if profile.hash.is_empty() {
+                sha256_hex(text.as_bytes())
+            } else {
+                profile.hash
+            };
+            if current.as_deref() == Some(hash.as_str())
+                || self_written.as_deref() == Some(hash.as_str())
+            {
+                return;
+            }
+            *self_written = Some(hash);
+            *current = Some(sha256_hex(text.as_bytes()));
+            record_history(db_path, &text);
+            if crate::clipboard::write_text(&text) {
+                info!("局域网直连收到远端剪贴板 ({} 字符)", text.chars().count());
+            } else {
+                warn!("局域网直连收到远端剪贴板，但写回系统剪贴板失败");
+            }
+        }
+        Event::Peer {
+            did,
+            name,
+            connected,
+        } => info!(
+            "局域网直连设备{}：{}（{}）",
+            if connected { "已连接" } else { "已断开" },
+            name,
+            did
+        ),
+        Event::Warning(w) => warn!("局域网直连：{}", w),
+    }
+}
+
 /// 历史持久化（SQLite，与 Android clipboard.db 同构；超长截断）。
 /// 本地复制与远端拉取共用：拉取写回触发的本地回声已被 self_written 抑制，
 /// 不会经由 LocalChanged 重复记录。
@@ -729,6 +828,22 @@ struct ClipboardSyncSelection {
     enabled: bool,
     #[serde(default)]
     plugin_id: String,
+    /// 通道列表，首个优先：`"p2p"` = 局域网直连，其它值是剪贴板同步插件 id。
+    /// 旧配置没有这个字段，按「有插件就同步」的老语义处理。
+    #[serde(default)]
+    channels: Vec<String>,
+}
+
+impl ClipboardSyncSelection {
+    /// 是否走局域网直连。
+    fn wants_p2p(&self) -> bool {
+        self.enabled && self.channels.iter().any(|c| c == "p2p")
+    }
+
+    /// 是否走同步插件。空 channels 视为旧配置，沿用原来的插件语义。
+    fn wants_plugin(&self) -> bool {
+        self.enabled && (self.channels.is_empty() || self.channels.iter().any(|c| c != "p2p"))
+    }
 }
 
 fn read_clipboard_sync_selection(root: &Path) -> ClipboardSyncSelection {
@@ -825,6 +940,43 @@ fn undo_apply(replaced: &[(PathBuf, PathBuf)], created: &[PathBuf]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn clipboard_selection_channels_decide_transport() {
+        let p2p: ClipboardSyncSelection =
+            toml::from_str("enabled = true\nchannels = [\"p2p\"]").expect("解析 p2p 选型");
+        assert!(p2p.wants_p2p());
+        assert!(!p2p.wants_plugin());
+
+        let auto: ClipboardSyncSelection =
+            toml::from_str("enabled = true\nchannels = [\"p2p\", \"webdav\"]")
+                .expect("解析自动选型");
+        assert!(auto.wants_p2p());
+        assert!(auto.wants_plugin());
+
+        let plugin: ClipboardSyncSelection =
+            toml::from_str("enabled = true\nchannels = [\"webdav\"]").expect("解析插件选型");
+        assert!(!plugin.wants_p2p());
+        assert!(plugin.wants_plugin());
+
+        // 旧配置没有 channels：沿用「有插件就同步」
+        let legacy: ClipboardSyncSelection =
+            toml::from_str("enabled = true\nplugin_id = \"webdav\"").expect("解析旧配置");
+        assert!(!legacy.wants_p2p());
+        assert!(legacy.wants_plugin());
+
+        let off: ClipboardSyncSelection =
+            toml::from_str("enabled = false\nchannels = [\"p2p\"]").expect("解析关闭配置");
+        assert!(!off.wants_p2p());
+        assert!(!off.wants_plugin());
+    }
+
+    #[test]
+    fn worker_key_changes_when_transport_changes() {
+        assert_eq!(worker_key("webdav", false), "webdav|");
+        assert_eq!(worker_key("webdav", true), "webdav|p2p");
+        assert_ne!(worker_key("webdav", false), worker_key("webdav", true));
+    }
+
     fn temp_root(label: &str) -> PathBuf {
         crate::test_support::test_root(&format!("plugins_{label}"))
     }
@@ -889,7 +1041,7 @@ plugin_id = \"test.clip\"
         let db = dir.join("clipboard.db");
         let (tx, rx) = mpsc::channel::<ClipboardCommand>();
         let db_for_worker = db.clone();
-        std::thread::spawn(move || run_clipboard_worker(None, db_for_worker, rx));
+        std::thread::spawn(move || run_clipboard_worker(None, None, db_for_worker, rx));
         tx.send(ClipboardCommand::LocalChanged("无插件也记录历史".to_string()))
             .unwrap_or_default();
         for _ in 0..50 {

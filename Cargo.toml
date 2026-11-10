@@ -26,6 +26,9 @@ xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", package 
 xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-plugin" }
 xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", package = "xime-speech" }
 
+# libximep2p — 局域网直连传输层（剪贴板同步用），rev 与 xime-setup 的 pair-page 一致。
+xime-p2p = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "b19ecdec2c0336669897cafe909541906024dc29" }
+
 # winxime workspace crates
 winxime-tsf = { path = "crates/winxime-tsf" }
 winxime-ipc = { path = "crates/winxime-ipc" }

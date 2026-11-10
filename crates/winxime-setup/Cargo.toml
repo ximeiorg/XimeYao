@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 # clipboard-page/backup-page/voice-page：剪贴板同步（插件）、云备份与语音转文本设置页
-xime-setup-lib = { workspace = true, features = ["clipboard-page", "backup-page", "voice-page"] }
+# pair-page：设备关联（局域网 P2P 配对，依赖 libximep2p 的 xime-p2p）。
+# 注意 pair-page 的匹配臂引用了 clipboard-page 门控的 SyncModeChanged，两个必须同开。
+xime-setup-lib = { workspace = true, features = ["clipboard-page", "backup-page", "voice-page", "pair-page"] }
 xime-config.workspace = true
 winxime-ipc.workspace = true
 windows = { version = "0.62.2", features = [

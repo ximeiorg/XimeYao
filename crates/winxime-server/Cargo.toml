@@ -22,6 +22,8 @@ xime-rime.workspace = true
 xime-plugin.workspace = true
 xime-speech.workspace = true
 xime-config.workspace = true
+# 局域网直连（剪贴板同步）：与设置页「设备关联」共用 xime-p2p 的配对表与身份。
+xime-p2p.workspace = true
 librime.workspace = true
 librime-sys2.workspace = true
 serde.workspace = true
