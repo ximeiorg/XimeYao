@@ -3,6 +3,26 @@
 > 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
 > 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
 
+## D-009 局域网直连接进宿主剪贴板线程
+
+- 日期：2026-11-10
+- 状态：生效（两台设备互传待实机）
+- 背景：`D-008` 让设置页能配对、能把 `channels` 写成 `["p2p"]`，但 Windows 的剪贴板工作线程只实现了 JS 插件通道，`channels` 字段没被读取；于是「配对成功、设置页显示设备互传、复制却不过去」。xime-p2p 库本身是完整的（`Node::start/set_clipboard/poll_event`），缺的只是宿主接线。
+- 决策：① `xime-p2p` 作为 `winxime-server` 的直接依赖，`rev` 跟随 core 已锁的 `b19ecde`；② `ClipboardSyncSelection` 读 `channels`：含 `"p2p"` 起节点、含非 `"p2p"` 值起同步插件、旧配置（无 `channels`）沿用「有插件就同步」；③ `Node` 与插件运行时都活在工作线程里，选型键（插件 id + 是否 P2P）变化时整条线程重建；④ 远端 `Event::Clipboard` 交给宿主原有的三态去重（当前内容 / 上次推送 / 自写回显），写回剪贴板与入历史走与插件通道相同的两个函数；⑤ 节点起不来只记 warn，不拖垮历史与插件通道。
+- 理由：Node 自带后台运行时，放进已有工作线程即可，不必再开一条线程或给宿主加异步运行时；通道判定放在宿主，设置程序与 Android daemon 写的是同一份 `clipboard_sync.toml`，语义只在这一处解释。去重复用三态，是因为「远端写回本地 → 本地监听再触发一次」的回声必须由同一个状态机挡掉，另起一套去重会与插件通道互相打架。
+- 影响与代价：依赖图多一个 git 包（构建期要能拉到 `libximep2p`）；工作线程生命周期多一个维度，切换通道会短暂停掉插件运行时（几百毫秒内重建）；「自动」模式目前两条通道都发，不判断 P2P 是否真的连上，靠 hash 去重兜底。
+- 遗留：只同步文本，图片/附件条目与插件通道一样跳过；`Event` 在 `b19ecde` 只有 `Clipboard/Peer/Warning` 三个变体，上游新增变体要在升 rev 时同步匹配臂；P2P 端口 `47821` 被占时由库自动顺延，跨机互通仍依赖同局域网与防火墙放行；配对、互传的运行时行为待两台设备实机。
+
+## D-008 设置页启用「设备关联」页，接上 libximep2p
+
+- 日期：2026-11-10
+- 状态：生效（待两台设备实机）
+- 背景：上游 `libximecore` 在 `ea8e300` 把 `xime-p2p` 拆到独立仓 `libximep2p`，并给设置库加了 `pair-page` feature 门控的「设备关联」页；XimeYao 之前没开这个 feature，所以 `libximep2p` 根本不在依赖图里，剪贴板页的局域网直连模式（`sync_plugin` 的 `p2p_peers`）也就没有配对入口。
+- 决策：① 给 `winxime-setup` 的 `xime-setup-lib` 依赖加 `pair-page`（与 `clipboard-page` 同开）；② 不另钉 `rev`，跟随 `libximecore` 已锁的 `libximep2p` rev `b19ecde`；③ 不改上游 `xime-p2p` / `xime-setup` 代码，宿主要补的只有 `AppMetadata` 字段。
+- 理由：`pair-page` 与 `clipboard-page` 必须同开——`pair-page` 的匹配臂引用 `Message::SyncModeChanged`，而这个变体与 `sync_plugin` 字段由 `clipboard-page` 门控（`xime-setup` 的 feature 组合缺口）。XimeYao 本来就要剪贴板页，同开无额外成本。跟上游 `rev` 是因为 `b19ecde` 是 `libximecore` 自己测过的组合，宿主擅自换 rev 会把两仓的测试结论作废。
+- 影响与代价：构建期要从 GitHub 拉 `libximep2p`，离线环境会失败（`Cargo.lock` 已锁 `b19ecde`，首次要联网）；设置页多一个侧栏页，用户数据目录同级多一个 `p2p/`（身份与配对表）；安装包体积略增。
+- 遗留：`pair-page` 单独开启仍编不过（`xime-setup` 的 `app.rs` 里「配对消息」的匹配臂没加与变体一致的 `cfg` 门控，属上游问题）；上游 `b19ecde` 落后 `libximep2p` 四个提交（含协议 v2），是否升级要上游决定；配对、互传的运行时行为待两台设备实机。
+
 ## D-007 词典导出路径由服务端生成，导入/恢复只收白名单内文件
 
 - 日期：2026-11-10
@@ -31,7 +51,7 @@
 - 决策：① `AsrModelProfile` 加 `checksum: Option<ModelChecksum { sha256, size_bytes }>`，回退 profile 清空 `checksum` 与 `download_url`；② 宿主下载时流式算摘要（`Sha256Writer`，不二次读盘），先比字节数再比 SHA-256，不符即删包、不解压；③ 无摘要一律拒绝安装；④ 解压先写暂存目录，成功后整体替换 `models/<id>/`，失败保留原模型；⑤ 只留 sha256（已隐含字节数），`size_bytes` 仅作廉价预检；⑥ 文案不得断言「被篡改」。
 - 理由：摘要把可变分支钉成确定内容，威胁模型覆盖「master 被换包 / 镜像或代理投毒 / 截断错包」，不覆盖注册表被改（摘要与包同源）。fail-closed 的理由是产物是本地 ONNX，进进程即攻击面；但回退 profile 若继承默认摘要，会把 A 的锚点套到未知 id 上，比没有校验更糟，所以源头清空。文案用「与内置校验值不一致」而不是「被篡改」：上游正常重打包也会不符，断言篡改等于撒谎。
 - 影响与代价：上游重打包后旧版本会装不上，只能升级程序；暂存目录让替换期峰值磁盘占用多一个解压体积；摘要值成为发布事实，改它必须走 `D-nnn`。
-- 遗留：`Cargo.toml` 的 8 个 libximecore git 依赖仍未钉 `rev`——本批改了 `xime-speech` 的公开结构体，`rev` 必须指向包含该字段的提交，该提交目前只在本机（`bf3b9ae`，2026-11-09 本地提交、未 push），需先推到 `ximeiorg/libximecore` 才能钉住；存量模型没有 TOFU 基线，本地改写解压产物不在防护范围；真实包端到端下载待用户验证。
+- 遗留：`Cargo.toml` 的 8 个 libximecore git 依赖仍未钉 `rev`——本批改了 `xime-speech` 的公开结构体，`rev` 必须指向包含该字段的提交，该提交目前只在本机（`b222de2`，2026-11-10 变基到上游 `b4714f6` 之后的本地提交、未 push），需先推到 `ximeiorg/libximecore` 才能钉住；存量模型没有 TOFU 基线，本地改写解压产物不在防护范围；真实包端到端下载待用户验证。
 
 ## D-004 语音模型包按「不可信输入」处理：下载与解压都设硬上限
 
