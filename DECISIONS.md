@@ -3,6 +3,16 @@
 > 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
 > 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
 
+## D-010 依赖钉到 libximecore 合并提交，版本升 0.4.0
+
+- 日期：2026-11-10
+- 状态：生效（CI 待重跑）
+- 背景：`D-005` 留下的 rev pin 一直卡在「core 改动没进上游」；本批 core 的 PR #6（`ModelChecksum` + 词典回调 Result）已合并为 `04d6ca9`，可以钉了。同时 `Cargo.toml` 的 8 个 core 依赖此前没有 rev，`Cargo.lock` 里又因本地 `[patch]` 记成 path，发布不可复现。
+- 决策：① 8 个 core git 依赖统一钉 `rev = 04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee`；② `Cargo.lock` 在临时移开本地 `[patch]` 后重新生成，core crate 记为 `git+…libximecore.git?rev=04d6ca9e…#04d6ca9e`；③ `workspace.package.version` 由 `0.3.2` 升 `0.4.0`，各 crate 随 workspace 继承。
+- 理由：rev 钉住后 CI、发布包与本地三处取的是同一份 core 源码，`D-005` 的摘要闸门才有稳定锚点；版本走次版本号，是因为本批含用户可见的新功能（剪贴板局域网直连、设置页「设备关联」），补丁号不足以表达能力变化。
+- 影响与代价：core 每有新提交都要手动升 rev（此前是隐式跟随 main）；本地 `[patch]` 与成品锁互斥——本地构建会把锁文件改回 path，提交前要还原；`cargo update` 顺带把 `crc32fast`、`sqlite-wasm-rs` 各升一个补丁版。
+- 遗留：`xime-p2p` 仍钉 `b19ecdec…`，等 libximep2p 的协议 v2 合入上游后再升；版本号升了但 MSI/MSIX 打包与实机验证未走（需管理员构建）。
+
 ## D-009 局域网直连接进宿主剪贴板线程
 
 - 日期：2026-11-10

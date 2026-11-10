@@ -1177,9 +1177,9 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.4"
+version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
 dependencies = [
  "cfg-if",
 ]
@@ -3059,6 +3059,7 @@ dependencies = [
 [[package]]
 name = "librime"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "librime-sys2",
  "once_cell",
@@ -3069,6 +3070,7 @@ dependencies = [
 [[package]]
 name = "librime-sys2"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "pkg-config",
  "windows 0.62.2",
@@ -5474,9 +5476,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36bd8e29bf08189a005b2df1df99823aa0861cabe9044e5f31ed54ca292ee618"
+checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
  "rsqlite-vfs",
@@ -7226,7 +7228,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-ipc"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "interprocess",
  "serde",
@@ -7236,7 +7238,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-server"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bzip2-rs",
@@ -7269,7 +7271,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-setup"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "tracing",
  "windows 0.62.2",
@@ -7282,7 +7284,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-tsf"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "librime",
@@ -7296,7 +7298,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-tsf-register"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -7395,6 +7397,7 @@ checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
 [[package]]
 name = "xime-config"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "filetime",
  "hex",
@@ -7439,6 +7442,7 @@ dependencies = [
 [[package]]
 name = "xime-plugin"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -7464,6 +7468,7 @@ dependencies = [
 [[package]]
 name = "xime-rime"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "librime",
  "librime-sys2",
@@ -7473,6 +7478,7 @@ dependencies = [
 [[package]]
 name = "xime-setup-lib"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7504,6 +7510,7 @@ dependencies = [
 [[package]]
 name = "xime-speech"
 version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "sherpa-onnx",
  "thiserror 2.0.21",

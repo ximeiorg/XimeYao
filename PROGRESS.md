@@ -11,11 +11,11 @@
 
 ## 当前状态
 
-- 版本：0.3.2（`Cargo.toml` 的 `workspace.package.version`）
+- 版本：0.4.0（`Cargo.toml` 的 `workspace.package.version`；2026-11-10 由 0.3.2 升）
 - 分支：`main` 与 `origin/main`（fork `tiengming/XimeYao`）同步于 `f0fa784`；本轮 17 个提交（`1bf9913` 起）已推送。上游 `ximeiorg/XimeYao`（旧名 `ximeiorg/winxime`，同一 HEAD `09ab350`）需走 PR：`tiengming` 对 `ximeiorg/winxime` 无 push 权限（`git push --dry-run upstream main` 返回 403）
 - 环境：Windows 11 专业版 10.0.26100 / rustc 1.98.0-nightly / node v24.22.1
 - 基线：build / clippy / test 三项 2026-11-10 实测通过（169 passed、1 ignored、0 failed + tsf 6 passed = 175；含 P1a 4 条、P1b 7 条、P2 7 条、P3a 5 条、P3b 13 条、P2P 接线 4 条）
-- 依赖：libximecore 已同步到上游 `b4714f6`（P2P 拆仓、设置页 UI 重构、剪贴板存储统一），本地两提交变基为 `b222de2`（`xime-speech` 摘要字段）与 `6affcfe`（词典回调 Result），未 push；新仓 libximep2p 克隆在 `D:\project\libximep2p`（HEAD `0865b35`，core 钉 `b19ecde`）；`winxime-setup` 已开 `pair-page`（`D-008`），本机依赖图里已有 `xime-p2p`；librime 子模块仍 `d71168e`
+- 依赖：libximecore 合入上游 `04d6ca9`（PR #6：`xime-speech` 摘要字段 + 词典回调 Result），8 个 core 依赖已钉 `rev`；本地 `[patch]` 仍指向 `D:\project\libximecore` 同提交克隆；新仓 libximep2p 克隆在 `D:\project\libximep2p`（HEAD `0865b35`，本项目钉 `b19ecde`）；`winxime-setup` 已开 `pair-page`（`D-008`）；librime 子模块仍 `d71168e`
 - 焦点：P1a、P2、P3a、P3b、P5 已本地提交，全部待实机验证；P1b 已按批准范围落地（动了两仓），待实机走一遍设置页；P3b 的 rev pin 卡在 `b222de2` 尚未推送到 `ximeiorg/libximecore`。
 
 ## 进行中
@@ -51,6 +51,7 @@
 | 2026-11-10 | 同步上游：libximecore 变基本地两提交到 `b4714f6`，克隆新仓 libximep2p 并验证「XimeYao → core → p2p」链路；补 `AppMetadata` 新增四字段；启用设置页「设备关联」（`D-008`） | [2026-11-10-libximep2p-chain.md](docs/verify/2026-11-10-libximep2p-chain.md) |
 | 2026-11-10 | 剪贴板局域网直连接入宿主剪贴板线程：`channels` 决定走插件还是 xime-p2p（`D-009`）；两台设备实机互传通过 | [2026-11-10-clipboard-p2p-host.md](docs/verify/2026-11-10-clipboard-p2p-host.md) |
 | 2026-11-10 | 仓库地址统一到 `ximeiorg/XimeYao`（`Cargo.toml` 与两份 `AppMetadata.homepage`）；关于页 UI 未改，入口随元数据指向新地址 | [2026-11-10-repo-address.md](docs/verify/2026-11-10-repo-address.md) |
+| 2026-11-10 | libximecore PR #6 合入（`04d6ca9`）；8 个 core 依赖钉 rev，版本升 `0.4.0`，锁文件重生成（`D-010`） | [2026-11-10-rev-pin-0.4.0.md](docs/verify/2026-11-10-rev-pin-0.4.0.md) |
 | 2026-10-29 | 版本 0.3.2；合并 upstream（删除 builtin-extra，不再分发 librime 默认方案） | `git 09ab350` |
 | 2026-10-27 | 托盘 owner 常驻、F1–F23 交还宿主、数字后回车提交 | `git eb9582a` |
 | 2026-10-27 | 内置方案 seed 管理、导入方案、删除下载包 | `git 7976083` |
@@ -88,10 +89,11 @@
 | 2026-11-10 | libximep2p 拆仓与三仓链路 | [2026-11-10-libximep2p-chain.md](docs/verify/2026-11-10-libximep2p-chain.md) | 编译与单测通过；运行时 P2P 待实机 |
 | 2026-11-10 | 剪贴板局域网直连接线 | [2026-11-10-clipboard-p2p-host.md](docs/verify/2026-11-10-clipboard-p2p-host.md) | 机检通过；两台设备互传实机通过 |
 | 2026-11-10 | 仓库地址对齐 | [2026-11-10-repo-address.md](docs/verify/2026-11-10-repo-address.md) | 机检通过；关于页入口待实机点一次 |
+| 2026-11-10 | 依赖钉 rev 与 0.4.0 | [2026-11-10-rev-pin-0.4.0.md](docs/verify/2026-11-10-rev-pin-0.4.0.md) | 机检通过（176 passed）；CI 待重跑 |
 
 ## 下一步
 
-- 已开 PR：`ximeiorg/XimeYao#26`（草稿，19 个提交，`tiengming:main` → `main`）与 `ximeiorg/libximecore#6`（`b222de2` 摘要字段 + `6affcfe` 词典回调 Result）。#26 的构建作业依赖 #6 先合入，再在 `Cargo.toml` 把 8 个 core 依赖钉到对应 `rev` 并重跑 CI。
+- 已开 PR：`ximeiorg/XimeYao#26`（草稿，`tiengming:main` → `main`）；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，XimeYao 已钉 rev 并升 0.4.0，等 CI 转绿后把 #26 转 ready。
 - 关于页实机点一次「项目主页」，确认打开的是 `https://github.com/ximeiorg/XimeYao`。
 - 上游同步：`origin` 是 fork，本轮已推送；要把改动送进 `ximeiorg/XimeYao` 得开 PR（本机账号无 push 权限，403）。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再给 8 个依赖钉 `rev`；推送恢复后用真实模型包走一次下载。
