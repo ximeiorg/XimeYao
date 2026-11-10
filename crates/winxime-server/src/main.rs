@@ -43,7 +43,7 @@ fn main() {
         settings_name: "曦码·曜 设置",
         subtitle: "输入法设置",
         tagline: "基于 Rime 引擎的五笔输入法",
-        homepage: "https://github.com/ximeiorg/winxime",
+        homepage: "https://github.com/ximeiorg/XimeYao",
         config_dir_name: "xime",
         config_file_base: "xime",
         distribution_name: "Xime Yao",

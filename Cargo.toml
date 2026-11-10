@@ -13,7 +13,7 @@ version = "0.3.2"
 edition = "2021"
 authors = ["Kor1 <kingzcheung@gmail.com>"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/ximeiorg/winxime"
+repository = "https://github.com/ximeiorg/XimeYao"
 
 [workspace.dependencies]
 # libximecore — git dep, patched to local via .cargo/config.toml
