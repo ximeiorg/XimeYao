@@ -5,6 +5,7 @@ mod clipboard;
 mod config;
 mod context;
 mod custom_phrase;
+mod dict_paths;
 mod hashing;
 mod ipc_server;
 mod models;
@@ -495,6 +496,8 @@ fn run_server(
     let context_clone = context.clone();
     let window_clone = window.clone();
     let ascii_mode_clone = ascii_mode.clone();
+    // 词典导入/导出的路径白名单以用户数据目录为根之一（见 `dict_paths`）。
+    let user_data_dir_for_ipc = user_data_dir.clone();
     let plugin_host_for_ipc = plugin_host.clone();
     std::thread::spawn(move || {
         ipc_server::run_ipc_server(
@@ -504,6 +507,7 @@ fn run_server(
             ascii_mode_clone,
             main_thread_id,
             plugin_host_for_ipc,
+            user_data_dir_for_ipc,
         );
     });
     info!("IPC thread started");

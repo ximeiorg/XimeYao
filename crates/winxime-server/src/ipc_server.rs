@@ -243,6 +243,20 @@ fn pipe_security_descriptor() -> Option<SecurityDescriptor> {
     }
 }
 
+/// 一个 IPC 连接处理期间不变化的宿主侧句柄与配置。
+///
+/// 逐项传参在加上「用户数据目录」后超过 clippy 的 7 参数上限；打包成结构体后
+/// 连接线程只克隆一个 `Arc`，也避免以后每加一个句柄就改一遍签名。
+struct ConnEnv {
+    engine: Arc<std::sync::Mutex<RimeEngine>>,
+    context: Arc<SharedInputContext>,
+    window: Arc<CandidateWindow>,
+    ascii_mode: Arc<AtomicBool>,
+    main_thread_id: u32,
+    plugin_host: Arc<PluginHost>,
+    user_data_dir: std::path::PathBuf,
+}
+
 pub fn run_ipc_server(
     engine: Arc<std::sync::Mutex<RimeEngine>>,
     context: Arc<SharedInputContext>,
@@ -250,6 +264,7 @@ pub fn run_ipc_server(
     ascii_mode: Arc<AtomicBool>,
     main_thread_id: u32,
     plugin_host: Arc<PluginHost>,
+    user_data_dir: std::path::PathBuf,
 ) {
     let pipe_path = get_pipe_path();
     tracing::info!("Winxime Server: creating named pipe at {}", pipe_path);
@@ -280,26 +295,23 @@ pub fn run_ipc_server(
 
     tracing::info!("Waiting for client connections...");
 
+    let env = Arc::new(ConnEnv {
+        engine,
+        context,
+        window,
+        ascii_mode,
+        main_thread_id,
+        plugin_host,
+        user_data_dir,
+    });
+
     for pipe in listener.incoming() {
         match pipe {
             Ok(p) => {
                 tracing::info!("Client connected!");
-                let engine_clone = engine.clone();
-                let context_clone = context.clone();
-                let window_clone = window.clone();
-                let ascii_mode_clone = ascii_mode.clone();
-                let tid = main_thread_id;
-                let plugin_host_clone = plugin_host.clone();
+                let env = Arc::clone(&env);
                 std::thread::spawn(move || {
-                    handle_connection(
-                        p,
-                        engine_clone,
-                        context_clone,
-                        window_clone,
-                        ascii_mode_clone,
-                        tid,
-                        plugin_host_clone,
-                    );
+                    handle_connection(p, env);
                 });
             }
             Err(e) => {
@@ -311,12 +323,7 @@ pub fn run_ipc_server(
 
 fn handle_connection(
     pipe: interprocess::os::windows::named_pipe::PipeStream<Bytes, Bytes>,
-    engine: Arc<std::sync::Mutex<RimeEngine>>,
-    context: Arc<SharedInputContext>,
-    window: Arc<CandidateWindow>,
-    ascii_mode: Arc<AtomicBool>,
-    main_thread_id: u32,
-    plugin_host: Arc<PluginHost>,
+    env: Arc<ConnEnv>,
 ) {
     let (recv, send) = pipe.split();
     let mut reader = BufReader::new(recv);
@@ -363,15 +370,7 @@ fn handle_connection(
         // 单向命令：客户端只写不等回包（`IpcClient::send_no_reply`），下面**必须不写**。
         // 协议没有请求 id，多写一条应答就留在管道里，被下一条请求当成自己的应答
         // （候选词/上屏文本串位，且完全不报错）。
-        let response = process_request(
-            &request,
-            &engine,
-            &context,
-            &window,
-            &ascii_mode,
-            main_thread_id,
-            &plugin_host,
-        );
+        let response = process_request(&request, env.as_ref());
 
         if request.command.is_one_way() {
             continue;
@@ -980,6 +979,7 @@ fn handle_dict_command(
     eng: &mut RimeEngine,
     context: &Arc<SharedInputContext>,
     window: &Arc<CandidateWindow>,
+    user_data_dir: &std::path::Path,
 ) -> IpcResponse {
     match request.command {
         IpcCommand::ListUserDicts => {
@@ -993,6 +993,7 @@ fn handle_dict_command(
                     sync_dir,
                     entries: Vec::new(),
                     total: 0,
+                    ..Default::default()
                 }),
                 ..IpcResponse::ok(request.session_id)
             }
@@ -1029,6 +1030,7 @@ fn handle_dict_command(
                         sync_dir: String::new(),
                         entries: read.entries,
                         total: read.total,
+                        ..Default::default()
                     }),
                     ..IpcResponse::ok(request.session_id)
                 },
@@ -1076,6 +1078,7 @@ fn handle_dict_command(
                         sync_dir: String::new(),
                         entries: Vec::new(),
                         total: 0,
+                        ..Default::default()
                     }),
                     ..IpcResponse::ok(request.session_id)
                 },
@@ -1106,6 +1109,7 @@ fn handle_dict_command(
                 sync_dir: String::new(),
                 entries: Vec::new(),
                 total: 0,
+                ..Default::default()
             }),
                 ..IpcResponse::default()
             }
@@ -1113,42 +1117,50 @@ fn handle_dict_command(
 
         IpcCommand::RestoreUserDict => {
             tracing::info!("RestoreUserDict requested");
-            let path = match &request.data {
+            let raw = match &request.data {
                 winxime_ipc::IpcRequestData::UserDictPath(p) => Some(p.clone()),
                 _ => None,
             };
-            let success = path
-                .map(|p| librime::restore_user_dict(&p).is_ok())
-                .unwrap_or(false);
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                ..IpcResponse::default()
+            let Some(raw) = raw else {
+                return dict_error(request.session_id, "缺少快照路径");
+            };
+            match crate::dict_paths::validate_input_path(&raw, user_data_dir) {
+                Ok(path) => match librime::restore_user_dict(&path.to_string_lossy()) {
+                    Ok(()) => IpcResponse::ok(request.session_id),
+                    Err(e) => dict_error(request.session_id, format!("恢复用户词典失败：{e:?}")),
+                },
+                Err(reason) => {
+                    tracing::warn!("RestoreUserDict 被拒：{reason}");
+                    dict_error(request.session_id, reason)
+                }
             }
         }
 
         IpcCommand::ExportUserDict => {
             tracing::info!("ExportUserDict requested");
-            let file = match &request.data {
-                winxime_ipc::IpcRequestData::UserDictFile(d, p) => Some((d.clone(), p.clone())),
+            // 路径由服务端生成：客户端只拿回路径去复制，不决定写哪儿（审计 F2）。
+            let dict = match &request.data {
+                winxime_ipc::IpcRequestData::UserDict(d) => Some(d.clone()),
                 _ => None,
             };
-            let result = match file {
-                Some((dict, path)) => librime::export_user_dict(&dict, &path),
-                None => Err(librime::error::Error::InvalidUtf8),
+            let Some(dict) = dict else {
+                return dict_error(request.session_id, "缺少词典名");
             };
-            let success = result.is_ok();
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
-                dicts: Vec::new(),
-                count,
-                sync_dir: String::new(),
-                entries: Vec::new(),
-                total: 0,
-            }),
-                ..IpcResponse::default()
+            let path = crate::dict_paths::export_path(&dict);
+            let path_str = path.to_string_lossy().into_owned();
+            match librime::export_user_dict(&dict, &path_str) {
+                Ok(count) => IpcResponse {
+                    dict_response: Some(winxime_ipc::DictResponse {
+                        count,
+                        exported_path: Some(path_str),
+                        ..Default::default()
+                    }),
+                    ..IpcResponse::ok(request.session_id)
+                },
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    dict_error(request.session_id, format!("导出用户词典失败：{e:?}"))
+                }
             }
         }
 
@@ -1158,22 +1170,24 @@ fn handle_dict_command(
                 winxime_ipc::IpcRequestData::UserDictFile(d, p) => Some((d.clone(), p.clone())),
                 _ => None,
             };
-            let result = match file {
-                Some((dict, path)) => librime::import_user_dict(&dict, &path),
-                None => Err(librime::error::Error::InvalidUtf8),
+            let Some((dict, raw)) = file else {
+                return dict_error(request.session_id, "缺少词典名或文件路径");
             };
-            let success = result.is_ok();
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
-                dicts: Vec::new(),
-                count,
-                sync_dir: String::new(),
-                entries: Vec::new(),
-                total: 0,
-            }),
-                ..IpcResponse::default()
+            match crate::dict_paths::validate_input_path(&raw, user_data_dir) {
+                Ok(path) => match librime::import_user_dict(&dict, &path.to_string_lossy()) {
+                    Ok(count) => IpcResponse {
+                        dict_response: Some(winxime_ipc::DictResponse {
+                            count,
+                            ..Default::default()
+                        }),
+                        ..IpcResponse::ok(request.session_id)
+                    },
+                    Err(e) => dict_error(request.session_id, format!("导入用户词典失败：{e:?}")),
+                },
+                Err(reason) => {
+                    tracing::warn!("ImportUserDict 被拒：{reason}");
+                    dict_error(request.session_id, reason)
+                }
             }
         }
         // 只有 process_request 确认命令属于本组后才会调到这里
@@ -1181,15 +1195,28 @@ fn handle_dict_command(
     }
 }
 
+/// 词典命令的失败响应：把可读原因塞进 `dict_response.error`，客户端直接展示。
+fn dict_error(session_id: u32, reason: impl Into<String>) -> IpcResponse {
+    IpcResponse {
+        dict_response: Some(winxime_ipc::DictResponse {
+            error: Some(reason.into()),
+            ..Default::default()
+        }),
+        ..IpcResponse::fail(session_id)
+    }
+}
+
 fn process_request(
     request: &IpcRequest,
-    engine: &Arc<std::sync::Mutex<RimeEngine>>,
-    context: &Arc<SharedInputContext>,
-    window: &Arc<CandidateWindow>,
-    ascii_mode: &Arc<AtomicBool>,
-    main_thread_id: u32,
-    plugin_host: &Arc<PluginHost>,
+    env: &ConnEnv,
 ) -> IpcResponse {
+    let engine = &env.engine;
+    let context = &env.context;
+    let window = &env.window;
+    let ascii_mode = &env.ascii_mode;
+    let main_thread_id = env.main_thread_id;
+    let plugin_host = &env.plugin_host;
+    let user_data_dir = env.user_data_dir.as_path();
     // 不碰引擎的命令在拿锁之前处理：方案词表首次解析大码表可能要
     // 几百毫秒（pinyin_simp ~39 万条），持锁做会挡住正在打字的键事件
     // （引擎 try_lock 失败时键事件直接失败）。这些命令只读/写 rime 目录的
@@ -1494,7 +1521,7 @@ fn process_request(
         | IpcCommand::RestoreUserDict
         | IpcCommand::ExportUserDict
         | IpcCommand::ImportUserDict => {
-            handle_dict_command(request, &mut eng, context, window)
+            handle_dict_command(request, &mut eng, context, window, user_data_dir)
         }
 
 
