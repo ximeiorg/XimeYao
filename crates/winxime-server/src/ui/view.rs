@@ -86,6 +86,9 @@ pub(crate) struct RenderedView {
 
 impl RenderedView {
     pub(crate) fn new(user_data: *const CandidateWindow) -> Result<Self, String> {
+        // SAFETY: user_data 指向 Box<CandidateWindow> 内的对象，生命周期覆盖窗口；
+        // CreateWindowExW 只在 WM_NCCREATE 里读一次该指针，不保留。调用发生在
+        // 即将运行消息循环的 UI 线程（见 ui/mod.rs 的 ensure_view_initialized）。
         unsafe {
             let hinstance = GetModuleHandleW(None).unwrap_or_default();
             let class_name = HSTRING::from(WINDOW_CLASS);
@@ -205,6 +208,10 @@ impl RenderedView {
         }
     }
 
+    /// # Safety
+    ///
+    /// 必须在 UI 线程调用，且 `swapchain` 与 `target` 属于同一个 `RenderedView`
+    /// （D2D 工厂是单线程的）；调用前该 target 上不应有未完成的绘制。
     pub(crate) unsafe fn create_swapchain_bitmap(
         swapchain: &IDXGISwapChain1,
         target: &ID2D1DeviceContext,
@@ -229,6 +236,10 @@ impl RenderedView {
         Ok(())
     }
 
+    /// # Safety
+    ///
+    /// 只由系统以本窗口类的窗口过程回调；`hwnd` 是已注册的候选栏窗口，
+    /// `wparam` 的裸指针按各消息的约定转移所有权（见对应分支）。
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
@@ -237,11 +248,15 @@ impl RenderedView {
     ) -> LRESULT {
         match msg {
             WM_NCCREATE => {
+                // SAFETY: WM_NCCREATE 的 lparam 是系统提供的 CREATESTRUCTW，回调期间有效；已判空。
                 let cs = lparam.0 as *const CREATESTRUCTW;
                 if !cs.is_null() {
+                    // SAFETY: 同一 CREATESTRUCTW，上一行已判空。
                     let user_data = unsafe { (*cs).lpCreateParams };
+                    // SAFETY: 本窗口句柄在窗口过程内有效；GWLP_USERDATA 只由 UI 线程写。
                     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, user_data as isize) };
                 }
+                // SAFETY: 参数由系统提供，原样转交默认过程。
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
             WM_SHOW_CANDIDATE => {
@@ -346,13 +361,17 @@ impl RenderedView {
                 debug!("WM_SHOW_ROOT received");
                 let root_ptr = wparam.0 as *mut RootModel;
                 if !root_ptr.is_null() {
+                    // SAFETY: 发送方用 Box::into_raw 转移 RootModel 的所有权，消息即移交，
+                    // 这里收回后立即 clone，不把指针留到下一轮消息。
                     let root = unsafe { Box::from_raw(root_ptr) };
                     debug!("showing root for '{}': {}", root.letter, root.root);
 
                     let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                     if !this_ptr.is_null() {
+                        // SAFETY: this_ptr 是 WM_NCCREATE 存入的窗口用户数据，窗口销毁前有效。
                         unsafe { (*this_ptr).root_model.replace(Some(*root.clone())) };
 
+                        // SAFETY: 同上，this_ptr 有效；borrow 只在 UI 线程内借用，不跨消息。
                         let view = unsafe { (*this_ptr).view.borrow() };
                         if let Some(view) = view.as_ref() {
                             let dpi = RenderedView::get_dpi_for_window(hwnd);
@@ -888,6 +907,7 @@ impl RenderedView {
     }
 
     pub(crate) fn get_dpi_for_window(hwnd: HWND) -> f32 {
+        // SAFETY: hwnd 是调用方持有的窗口句柄；输出参数都在栈上，API 失败时保持 96 DPI 初值。
         unsafe {
             let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             let mut dpi_x = 96u32;
@@ -898,6 +918,7 @@ impl RenderedView {
     }
 
     fn get_dpi_for_point(point: POINT) -> f32 {
+        // SAFETY: 坐标按值传入；输出参数在栈上，API 失败时保持 96 DPI 初值。
         unsafe {
             let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
             let mut dpi_x = 96u32;
@@ -908,6 +929,7 @@ impl RenderedView {
     }
 
     fn clamp_point_to_monitor(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+        // SAFETY: 坐标按值传入；MONITORINFO 在栈上且 cbSize 已填，API 失败时回落原坐标。
         unsafe {
             let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
@@ -930,6 +952,10 @@ impl RenderedView {
     /// 进入语音页：查一次模型文件 + 预装载识别器（摊掉 ~3s 装载延迟）+ 开轮询定时器。
     ///
     /// 模型没下载时预装载只写一句错误到快照里，不阻塞、不崩。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 UI 线程调用，`hwnd` 必须是本候选栏窗口；它会操作候选栏的定时器与面板状态。
     unsafe fn enter_voice_page(this: &CandidateWindow, hwnd: HWND) {
         this.refresh_voice(true);
         speech::SpeechEngine::global_warmup();
@@ -945,6 +971,10 @@ impl RenderedView {
     /// 离开语音页：关轮询定时器；`cancel_if_listening` 为 true 且仍在采集时丢弃本次
     /// （不让一个没人管的麦克风留在后台）。已发过 Stop 的路径传 false——那条路的
     /// 收尾由上屏负责。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 UI 线程调用，`hwnd` 必须是本候选栏窗口；与 `enter_voice_page` 成对使用。
     unsafe fn leave_voice_page(this: &CandidateWindow, hwnd: HWND, cancel_if_listening: bool) {
         if this.voice_timer.get() {
             let _ = KillTimer(Some(hwnd), VOICE_TIMER_ID);
@@ -962,6 +992,10 @@ impl RenderedView {
     ///
     /// 「结束并上屏」的收尾（finalize → F24 上屏 → toast）在工作线程里做，
     /// 面板这边随即收起：上屏后宿主会结束组合，候选栏本就该消失。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 UI 线程调用；会改动识别器全局状态与面板布局。
     unsafe fn toggle_voice(this: &CandidateWindow, hwnd: HWND) {
         if this.voice.borrow().state == SpeechState::Listening {
             speech::SpeechEngine::global_stop();
@@ -976,6 +1010,10 @@ impl RenderedView {
 
     /// 按当前面板状态重算窗口尺寸、缓存布局结果并重绘。
     /// 供面板展开/收起与 hover 重绘复用（须在 UI 线程调用）。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 UI 线程调用，`hwnd` 必须是本候选栏窗口；内部会借用 `this` 的多个 `RefCell`。
     unsafe fn relayout_and_repaint(this: &CandidateWindow, hwnd: HWND) {
         let model = this.model.borrow();
         let view = this.view.borrow();
