@@ -91,6 +91,7 @@
 
 ## 下一步
 
+- 已开 PR：`ximeiorg/XimeYao#26`（草稿，19 个提交，`tiengming:main` → `main`）与 `ximeiorg/libximecore#6`（`b222de2` 摘要字段 + `6affcfe` 词典回调 Result）。#26 的构建作业依赖 #6 先合入，再在 `Cargo.toml` 把 8 个 core 依赖钉到对应 `rev` 并重跑 CI。
 - 关于页实机点一次「项目主页」，确认打开的是 `https://github.com/ximeiorg/XimeYao`。
 - 上游同步：`origin` 是 fork，本轮已推送；要把改动送进 `ximeiorg/XimeYao` 得开 PR（本机账号无 push 权限，403）。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再给 8 个依赖钉 `rev`；推送恢复后用真实模型包走一次下载。
