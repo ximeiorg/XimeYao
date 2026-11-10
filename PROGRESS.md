@@ -12,7 +12,7 @@
 ## 当前状态
 
 - 版本：0.3.2（`Cargo.toml` 的 `workspace.package.version`）
-- 分支：`main`，本地领先 `origin/main`（`763df7a`）17 个提交（`1bf9913` 起，含 `815bca1` P2P 接线与本轮仓库地址/文档）；`origin` 是 fork `tiengming/XimeYao`，上游 `ximeiorg/XimeYao` 与 `ximeiorg/winxime`（改名前的旧地址）同一 HEAD `09ab350`
+- 分支：`main` 与 `origin/main`（fork `tiengming/XimeYao`）同步于 `f0fa784`；本轮 17 个提交（`1bf9913` 起）已推送。上游 `ximeiorg/XimeYao`（旧名 `ximeiorg/winxime`，同一 HEAD `09ab350`）需走 PR：`tiengming` 对 `ximeiorg/winxime` 无 push 权限（`git push --dry-run upstream main` 返回 403）
 - 环境：Windows 11 专业版 10.0.26100 / rustc 1.98.0-nightly / node v24.22.1
 - 基线：build / clippy / test 三项 2026-11-10 实测通过（169 passed、1 ignored、0 failed + tsf 6 passed = 175；含 P1a 4 条、P1b 7 条、P2 7 条、P3a 5 条、P3b 13 条、P2P 接线 4 条）
 - 依赖：libximecore 已同步到上游 `b4714f6`（P2P 拆仓、设置页 UI 重构、剪贴板存储统一），本地两提交变基为 `b222de2`（`xime-speech` 摘要字段）与 `6affcfe`（词典回调 Result），未 push；新仓 libximep2p 克隆在 `D:\project\libximep2p`（HEAD `0865b35`，core 钉 `b19ecde`）；`winxime-setup` 已开 `pair-page`（`D-008`），本机依赖图里已有 `xime-p2p`；librime 子模块仍 `d71168e`
@@ -92,7 +92,7 @@
 ## 下一步
 
 - 关于页实机点一次「项目主页」，确认打开的是 `https://github.com/ximeiorg/XimeYao`。
-- 上游同步：`origin` 是 fork；要把 17 个提交送进 `ximeiorg/XimeYao`，需 `git push upstream main`（要权限）或开 PR，推送前先确认远端分支策略。
+- 上游同步：`origin` 是 fork，本轮已推送；要把改动送进 `ximeiorg/XimeYao` 得开 PR（本机账号无 push 权限，403）。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再给 8 个依赖钉 `rev`；推送恢复后用真实模型包走一次下载。
 - P1b 待实机：`.\rebuild.ps1` → 设置页 → 词典 → 导出/导入/从快照恢复各一次，按档案 4 步看提示。
 - P5 收尾：四批注释已落地，待实机走候选栏、语音页与 `winxime-tsf-register -install/-uninstall`。
