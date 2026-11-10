@@ -22,6 +22,8 @@ xime-rime.workspace = true
 xime-plugin.workspace = true
 xime-speech.workspace = true
 xime-config.workspace = true
+# 局域网直连（剪贴板同步）：与设置页「设备关联」共用 xime-p2p 的配对表与身份。
+xime-p2p.workspace = true
 librime.workspace = true
 librime-sys2.workspace = true
 serde.workspace = true
@@ -45,6 +47,9 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_Audio",
+    # 命名管道 ACL 用当前用户 SID（审计 F1）：取 token → 取 user SID → 转字符串。
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

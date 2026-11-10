@@ -146,11 +146,15 @@ pub enum IpcCommand {
     ListUserDicts,
     /// 词典管理：备份用户词典快照到同步目录（data = UserDict）。
     BackupUserDict,
-    /// 词典管理：从快照文件恢复（data = UserDictPath）。
+    /// 词典管理：从快照文件恢复（data = UserDictPath；路径必须在用户数据目录或临时目录内）。
     RestoreUserDict,
-    /// 词典管理：导出用户词典为文本（data = UserDictFile(dict, path)）。
+    /// 词典管理：导出用户词典为文本（data = UserDict）。
+    ///
+    /// 导出文件由服务端在系统临时目录生成，路径随响应返回（`DictResponse.exported_path`），
+    /// 客户端只读、自行复制到用户选择的位置。
     ExportUserDict,
-    /// 词典管理：从文本导入用户词典（data = UserDictFile(dict, path)）。
+    /// 词典管理：从文本导入用户词典（data = UserDictFile(dict, path)；
+    /// 路径必须在用户数据目录或临时目录内，否则服务端拒绝）。
     ImportUserDict,
     /// 词典管理：读取用户词典词条用于浏览/搜索（data = UserDictQuery(dict, query)）。
     ListDictEntries,
@@ -320,6 +324,12 @@ pub struct DictResponse {
     /// 词条总数（ListDictEntries 时填充，未受关键词过滤与条数上限影响）。
     #[serde(default)]
     pub total: i32,
+    /// 服务端生成的导出文件路径（ExportUserDict 成功时填充）。
+    #[serde(default)]
+    pub exported_path: Option<String>,
+    /// 可读的失败原因（成功时为空）：用于告诉用户是路径被拒、格式不对还是词库被占用。
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// 用户词典中的一条词条（词 / 编码 / 频率）。

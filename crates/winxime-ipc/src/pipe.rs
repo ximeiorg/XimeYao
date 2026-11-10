@@ -117,6 +117,13 @@ fn is_pipe_gone(error: &std::io::Error) -> bool {
     }
 }
 
+/// 从词典命令的失败响应里取可读原因；服务端没给就退回调用方给的默认文案。
+fn dict_error_message(response: Option<crate::DictResponse>, fallback: &str) -> String {
+    response
+        .and_then(|d| d.error)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 impl IpcClient {
     pub fn connect() -> Result<Self, IpcError> {
         connect_pipe(CONNECT_TIMEOUT).map(|pipe| Self { pipe: Some(pipe) })
@@ -398,54 +405,72 @@ impl IpcClient {
     }
 
     /// 从快照文件恢复用户词典。
-    pub fn restore_user_dict(snapshot_path: &str) -> bool {
-        if let Ok(mut client) = Self::connect() {
-            let request = crate::IpcRequest {
-                command: crate::IpcCommand::RestoreUserDict,
-                session_id: 0,
-                data: crate::IpcRequestData::UserDictPath(snapshot_path.to_string()),
-            };
-            match client.send_request_with_timeout(&request, SLOW_TIMEOUT) {
-                Ok(response) => response.success,
-                Err(_) => false,
-            }
+    ///
+    /// 路径必须落在用户数据目录或系统临时目录内，否则服务端拒绝并回可读原因
+    /// （审计 F2 的路径白名单）；设置页宿主会先把用户选的文件复制进临时目录。
+    pub fn restore_user_dict(snapshot_path: &str) -> Result<(), String> {
+        let mut client = Self::connect().map_err(|_| "输入法服务未运行".to_string())?;
+        let request = crate::IpcRequest {
+            command: crate::IpcCommand::RestoreUserDict,
+            session_id: 0,
+            data: crate::IpcRequestData::UserDictPath(snapshot_path.to_string()),
+        };
+        let response = client
+            .send_request_with_timeout(&request, SLOW_TIMEOUT)
+            .map_err(|e| format!("与输入法服务通信失败：{e}"))?;
+        if response.success {
+            Ok(())
         } else {
-            false
+            Err(dict_error_message(response.dict_response, "恢复用户词典失败"))
         }
     }
 
-    /// 导出用户词典为文本，返回记录条数。
-    pub fn export_user_dict(dict: &str, path: &str) -> Option<i32> {
-        if let Ok(mut client) = Self::connect() {
-            let request = crate::IpcRequest {
-                command: crate::IpcCommand::ExportUserDict,
-                session_id: 0,
-                data: crate::IpcRequestData::UserDictFile(dict.to_string(), path.to_string()),
-            };
-            match client.send_request_with_timeout(&request, SLOW_TIMEOUT) {
-                Ok(response) => response.dict_response.map(|d| d.count),
-                Err(_) => None,
-            }
-        } else {
-            None
+    /// 导出用户词典为文本，返回（记录条数, 服务端生成的文件路径）。
+    ///
+    /// 文件由服务端写在系统临时目录，调用方读走/复制后应自行删除；服务端不再
+    /// 接受调用方指定的写入路径（审计 F2）。
+    pub fn export_user_dict(dict: &str) -> Result<(i32, String), String> {
+        let mut client = Self::connect().map_err(|_| "输入法服务未运行".to_string())?;
+        let request = crate::IpcRequest {
+            command: crate::IpcCommand::ExportUserDict,
+            session_id: 0,
+            data: crate::IpcRequestData::UserDict(dict.to_string()),
+        };
+        let response = client
+            .send_request_with_timeout(&request, SLOW_TIMEOUT)
+            .map_err(|e| format!("与输入法服务通信失败：{e}"))?;
+        if !response.success {
+            return Err(dict_error_message(response.dict_response, "导出用户词典失败"));
         }
+        let dict_response = response
+            .dict_response
+            .ok_or_else(|| "服务端没有返回导出结果".to_string())?;
+        let path = dict_response
+            .exported_path
+            .ok_or_else(|| "服务端没有返回导出文件路径".to_string())?;
+        Ok((dict_response.count, path))
     }
 
     /// 从文本导入用户词典，返回记录条数。
-    pub fn import_user_dict(dict: &str, path: &str) -> Option<i32> {
-        if let Ok(mut client) = Self::connect() {
-            let request = crate::IpcRequest {
-                command: crate::IpcCommand::ImportUserDict,
-                session_id: 0,
-                data: crate::IpcRequestData::UserDictFile(dict.to_string(), path.to_string()),
-            };
-            match client.send_request_with_timeout(&request, SLOW_TIMEOUT) {
-                Ok(response) => response.dict_response.map(|d| d.count),
-                Err(_) => None,
-            }
-        } else {
-            None
+    ///
+    /// 路径限制同 [`Self::restore_user_dict`]：只接受用户数据目录或临时目录内的真实文件。
+    pub fn import_user_dict(dict: &str, path: &str) -> Result<i32, String> {
+        let mut client = Self::connect().map_err(|_| "输入法服务未运行".to_string())?;
+        let request = crate::IpcRequest {
+            command: crate::IpcCommand::ImportUserDict,
+            session_id: 0,
+            data: crate::IpcRequestData::UserDictFile(dict.to_string(), path.to_string()),
+        };
+        let response = client
+            .send_request_with_timeout(&request, SLOW_TIMEOUT)
+            .map_err(|e| format!("与输入法服务通信失败：{e}"))?;
+        if !response.success {
+            return Err(dict_error_message(response.dict_response, "导入用户词典失败"));
         }
+        response
+            .dict_response
+            .map(|d| d.count)
+            .ok_or_else(|| "服务端没有返回导入结果".to_string())
     }
 
     /// 读取用户词典词条（query 为空即不过滤），返回词条列表与总数。

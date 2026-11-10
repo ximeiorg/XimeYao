@@ -515,12 +515,14 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
             Some(target) => target.clone(),
             None => {
                 let doc_mgr = match self.thread_mgr.as_ref() {
+
                     Some(t) => unsafe { t.GetFocus() }?,
                     None => {
                         debug!("DoEditSession: no thread_mgr and no target context");
                         return Ok(());
                     }
                 };
+
                 unsafe { doc_mgr.GetBase() }?
             }
         };
@@ -586,6 +588,7 @@ impl XimeEditSession_Impl {
         use std::mem::ManuallyDrop;
         use std::ops::Deref;
 
+
         unsafe {
             let mut selection = [TF_SELECTION::default(); 1];
             let mut selection_len = 0;
@@ -649,6 +652,7 @@ impl XimeEditSession_Impl {
                 return;
             }
         };
+
 
         unsafe {
             let range = match insert_at_selection.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[]) {
@@ -731,6 +735,7 @@ impl XimeEditSession_Impl {
             }
         };
         if let Some(ref composition) = *comp {
+
             unsafe {
                 if let Ok(range) = composition.GetRange() {
                     let wide: Vec<u16> = preedit.encode_utf16().collect();
@@ -764,6 +769,7 @@ impl XimeEditSession_Impl {
         match self.composition.try_lock() {
             Ok(mut guard) => {
                 if let Some(comp) = guard.take() {
+
                     unsafe {
                         comp.EndComposition(ec).ok();
                     }
@@ -771,6 +777,7 @@ impl XimeEditSession_Impl {
             }
             Err(std::sync::TryLockError::Poisoned(e)) => {
                 if let Some(comp) = e.into_inner().take() {
+
                     unsafe {
                         comp.EndComposition(ec).ok();
                     }
@@ -798,6 +805,7 @@ impl XimeTextService_Impl {
             Err(_) => return,
         };
         if let Some(ref sink) = *sink {
+
             unsafe {
                 let _ = sink.OnUpdate(TF_LBI_STATUS | TF_LBI_ICON | TF_LBI_TEXT);
             }
@@ -835,6 +843,7 @@ impl XimeTextService_Impl {
                 use std::mem::ManuallyDrop;
                 use std::ops::Deref;
 
+
                 unsafe {
                     let mut selection = [TF_SELECTION::default(); 1];
                     let mut selection_len = 0;
@@ -866,6 +875,7 @@ impl XimeTextService_Impl {
 
         let tid = self.client_id.get();
         let session = SelectionRect::new(context.clone()).into_object();
+
 
         let _ = unsafe {
             context.RequestEditSession(
@@ -926,6 +936,7 @@ impl XimeTextService_Impl {
             "schedule_edit_session: tid={}, calling RequestEditSession",
             tid
         );
+
         let ok = unsafe {
             let result = context.RequestEditSession(
                 tid,
@@ -1403,6 +1414,7 @@ fn host_exe_name() -> String {
     use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 
     let mut buf = [0u16; 512];
+
     let len = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
     if len == 0 {
         return "unknown".to_string();
@@ -1524,6 +1536,7 @@ impl XimeTextService_Impl {
                 use windows_core::ComObjectInterface;
                 let key_sink_ref = ComObjectInterface::<ITfKeyEventSink>::as_interface_ref(self);
                 let key_sink: ITfKeyEventSink = key_sink_ref.to_owned();
+
                 unsafe {
                     if kmgr.AdviseKeyEventSink(tid, &key_sink, true).is_ok() {
                         debug!("AdviseKeyEventSink succeeded");
@@ -1544,6 +1557,7 @@ impl XimeTextService_Impl {
                     self.lang_bar_sink_ref.clone(),
                 );
                 let lang_bar_itf: ITfLangBarItemButton = lang_bar.into();
+
                 let add_result = unsafe { lang_bar_mgr.AddItem(&lang_bar_itf) };
                 match add_result {
                     Ok(_) => {
@@ -1570,6 +1584,7 @@ impl XimeTextService_Impl {
                         self,
                     );
                 let profile_sink: ITfActiveLanguageProfileNotifySink = profile_sink_ref.to_owned();
+
                 unsafe {
                     if let Ok(cookie) =
                         source.AdviseSink(&ITfActiveLanguageProfileNotifySink::IID, &profile_sink)
@@ -1586,6 +1601,7 @@ impl XimeTextService_Impl {
                 let thread_focus_sink_ref =
                     ComObjectInterface::<ITfThreadFocusSink>::as_interface_ref(self);
                 let thread_focus_sink: ITfThreadFocusSink = thread_focus_sink_ref.to_owned();
+
                 unsafe {
                     if let Ok(cookie) =
                         source.AdviseSink(&ITfThreadFocusSink::IID, &thread_focus_sink)
@@ -1603,6 +1619,7 @@ impl XimeTextService_Impl {
                     ComObjectInterface::<ITfThreadMgrEventSink>::as_interface_ref(self);
                 let thread_mgr_event_sink: ITfThreadMgrEventSink =
                     thread_mgr_event_sink_ref.to_owned();
+
                 unsafe {
                     if let Ok(cookie) =
                         source.AdviseSink(&ITfThreadMgrEventSink::IID, &thread_mgr_event_sink)
@@ -1630,6 +1647,7 @@ impl XimeTextService_Impl {
         // Unregister profile sink
         if self.profile_sink_cookie.get() != TF_INVALID_COOKIE {
             if let Some(source) = self.profile_source.borrow_mut().take() {
+
                 unsafe {
                     let _ = source.UnadviseSink(self.profile_sink_cookie.get());
                 }
@@ -1640,6 +1658,7 @@ impl XimeTextService_Impl {
         // Unregister thread focus sink
         if self.thread_focus_sink_cookie.get() != TF_INVALID_COOKIE {
             if let Some(source) = self.thread_focus_source.borrow_mut().take() {
+
                 unsafe {
                     let _ = source.UnadviseSink(self.thread_focus_sink_cookie.get());
                 }
@@ -1651,6 +1670,7 @@ impl XimeTextService_Impl {
         if self.thread_mgr_event_sink_cookie.get() != TF_INVALID_COOKIE {
             if let Some(thread_mgr) = self.thread_mgr.borrow().as_ref() {
                 if let Ok(source) = thread_mgr.cast::<ITfSource>() {
+
                     unsafe {
                         let _ = source.UnadviseSink(self.thread_mgr_event_sink_cookie.get());
                     }
@@ -1662,6 +1682,7 @@ impl XimeTextService_Impl {
         // UnadviseKeyEventSink using thread_mgr
         if let Some(thread_mgr) = self.thread_mgr.borrow().as_ref() {
             if let Ok(kmgr) = thread_mgr.cast::<ITfKeystrokeMgr>() {
+
                 unsafe {
                     let _ = kmgr.UnadviseKeyEventSink(self.client_id.get());
                 }
@@ -1670,6 +1691,7 @@ impl XimeTextService_Impl {
 
         if let Some(lang_bar_mgr) = self.lang_bar_mgr.borrow_mut().take() {
             if let Some(lang_bar_item) = self.lang_bar_item.borrow_mut().take() {
+
                 unsafe {
                     if let Err(e) = lang_bar_mgr.RemoveItem(&lang_bar_item) {
                         debug!("RemoveItem failed: {:?}", e);
@@ -1707,6 +1729,7 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
         guidprofile: *const GUID,
         factivated: BOOL,
     ) -> Result<()> {
+
         let clsid_ref = unsafe { clsid.as_ref() };
         let profile_ref = unsafe { guidprofile.as_ref() };
 
@@ -1758,6 +1781,7 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
                         Err(_) => return Ok(()),
                     };
                     if let Some(ref sink) = *sink {
+
                         unsafe {
                             let _ = sink.OnUpdate(TF_LBI_STATUS | TF_LBI_ICON | TF_LBI_TEXT);
                         }
@@ -1851,6 +1875,7 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
                             "  -> flush: composition already terminated, skip commit"
                         );
                     } else if let Some(prev) = pdimprevfocus.as_ref() {
+
                         match unsafe { prev.GetTop() } {
                             Ok(prev_context) => {
                                 commit_scheduled =
@@ -1904,6 +1929,7 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
                     }
                 };
                 if let Some(ref sink) = *sink {
+
                     unsafe {
                         let _ = sink.OnUpdate(TF_LBI_STATUS | TF_LBI_ICON | TF_LBI_TEXT);
                     }

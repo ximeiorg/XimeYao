@@ -24,6 +24,10 @@ pub fn model_dir(user_data_dir: &Path, model_id: &str) -> PathBuf {
 }
 
 /// 创建（如不存在）并返回模型目录；对齐安卓「用到才建」。
+///
+/// 线上下载走「暂存目录 → 整体替换」，不再直接建目标目录；这里留给测试造
+/// 已下载模型的现场。
+#[cfg(test)]
 pub fn ensure_model_dir(user_data_dir: &Path, model_id: &str) -> Result<PathBuf, String> {
     let dir = model_dir(user_data_dir, model_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建模型目录失败: {}", e))?;

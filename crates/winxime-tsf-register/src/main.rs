@@ -139,6 +139,8 @@ fn remove_install_dir() -> Result<()> {
 }
 
 fn remove_registry_keys() -> Result<()> {
+    // SAFETY: 根键是系统预定义句柄；键名由 `w!` 生成，是 NUL 结尾的静态宽串；只做删除，
+    // 键不存在时按返回码 2 走正常分支。
     unsafe {
         let hklm = HKEY_LOCAL_MACHINE;
 
@@ -165,6 +167,9 @@ fn remove_registry_keys() -> Result<()> {
 }
 
 fn register_dll(dll_path: &str) -> Result<()> {
+    // SAFETY: 路径转成 NUL 结尾的 UTF-16 并在本块内存活；DLL 由 LoadLibraryW 保持加载；
+    // GetProcAddress 取的是本项目自己的 TSF DLL，`DllRegisterServer` 的签名由 COM 约定，
+    // transmute 只把 FARPROC 转成同一 ABI 的函数指针。
     unsafe {
         let dll_path_wide: Vec<u16> = dll_path.encode_utf16().chain(std::iter::once(0)).collect();
         let hmodule = LoadLibraryW(PCWSTR::from_raw(dll_path_wide.as_ptr()))?;
@@ -183,6 +188,7 @@ fn register_dll(dll_path: &str) -> Result<()> {
 }
 
 fn unregister_dll(dll_path: &str) -> Result<()> {
+    // SAFETY: 同 register_dll；导出符号 `DllUnregisterServer` 由同一 DLL 提供，签名按 COM 约定。
     unsafe {
         let dll_path_wide: Vec<u16> = dll_path.encode_utf16().chain(std::iter::once(0)).collect();
         let hmodule = LoadLibraryW(PCWSTR::from_raw(dll_path_wide.as_ptr()))?;
@@ -201,6 +207,8 @@ fn unregister_dll(dll_path: &str) -> Result<()> {
 }
 
 fn register(icon_path: String) -> Result<()> {
+    // SAFETY: COM 已在 main 里按 STA 初始化；CLSID/GUID 与注册表键均为常量；profile 名、
+    // 图标路径的宽串都在本块内存活到调用返回。
     unsafe {
         let input_processor_profile_mgr: ITfInputProcessorProfileMgr =
             CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
@@ -239,6 +247,7 @@ fn register(icon_path: String) -> Result<()> {
 }
 
 fn unregister() -> Result<()> {
+    // SAFETY: 同 register；删除分类与语言配置只依赖常量 CLSID/GUID，宽串常量由 `w!` 生成。
     unsafe {
         let input_processor_profile_mgr: ITfInputProcessorProfileMgr =
             CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
@@ -276,12 +285,14 @@ fn unregister() -> Result<()> {
 }
 
 fn enable() {
+    // SAFETY: XIME_TIP_DESC 是 NUL 结尾的静态宽串常量，生命周期覆盖调用。
     unsafe {
         InstallLayoutOrTip(XIME_TIP_DESC.as_ptr(), ILOT_INSTALL);
     }
 }
 
 fn disable() {
+    // SAFETY: 同 enable；只做注销，字符串仍是静态常量。
     unsafe {
         InstallLayoutOrTip(XIME_TIP_DESC.as_ptr(), ILOT_UNINSTALL);
     }
@@ -327,6 +338,8 @@ fn arg_at(n: usize, what: &str) -> String {
 }
 
 fn main() -> Result<()> {
+    // SAFETY: 命令行入口先挂父控制台再按 STA 初始化 COM；两者失败都不影响参数分发，
+    // 后续 CoCreateInstance 失败会按 Result 返回错误。
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 use windows::Win32::{
@@ -78,7 +78,8 @@ static mut TRAY_HWND: Option<HWND> = None;
 static TRAY_HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static mut TRAY_MENU: Option<HMENU> = None;
 static mut TRAY_ON_ACTION: Option<Arc<dyn Fn(TrayAction) + Send + Sync>> = None;
-static mut TRAY_IS_ASCII: bool = false;
+/// 当前中/英状态。由 IPC 线程写入、窗口线程读取，所以用原子量而不是 `static mut`。
+static TRAY_IS_ASCII: AtomicBool = AtomicBool::new(false);
 static mut TRAY_SWITCH_PROVIDER: Option<SwitchProvider> = None;
 /// 最近一次弹出时渲染的开关项（id → 数据）。
 static TRAY_SWITCH_ITEMS: Mutex<Vec<SwitchMenuItem>> = Mutex::new(Vec::new());
@@ -127,6 +128,7 @@ pub fn show_balloon(title: &str, body: &str) -> bool {
     nid.dwInfoFlags = NIIF_INFO;
     set_wide(&mut nid.szInfoTitle, title);
     set_wide(&mut nid.szInfo, body);
+// SAFETY: hwnd 取自原子量，窗口由本进程创建；nid 是栈上结构，调用期间有效，失败只返回 false。
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
 }
 
@@ -140,8 +142,10 @@ impl TrayIcon {
     /// 的 Deactivate 不会把前台图标藏掉。TSF 的焦点进出不参与显隐。
     pub fn install(on_action: Arc<dyn Fn(TrayAction) + Send + Sync>, switch_provider: SwitchProvider) {
         let hwnd = Self::create_window();
+// SAFETY: CreatePopupMenu 失败返回默认 HMENU（空句柄），后续 AppendMenu 失败无副作用；成功时句柄由 TRAY_MENU 持有到 WM_DESTROY/cleanup。
         let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
 
+// SAFETY: 只在主线程（创建托盘窗口与消息循环的线程）写这些 static mut；hwnd/menu 是本线程刚创建的句柄，on_action/provider 随 TRAY_* 一起存活到 cleanup。
         unsafe {
             TRAY_HWND = Some(hwnd);
             TRAY_HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
@@ -156,6 +160,7 @@ impl TrayIcon {
     }
 
     fn create_window() -> HWND {
+// SAFETY: 句柄来自本线程的 GetModuleHandleW；class_name 在 RegisterClassW/CreateWindowExW 调用期间存活，windows 层只读其指针。
         unsafe {
             let hinst = GetModuleHandleW(None).unwrap_or_default();
 
@@ -190,6 +195,7 @@ impl TrayIcon {
     }
 
     fn add_icon(hwnd: HWND) {
+// SAFETY: hwnd 是 install 传入的活窗口；hicon 来自 load_icon_from_ico（失败回落系统图标），nid 调用期间有效。
         unsafe {
             let hicon = load_icon_from_ico(get_icon_for_mode(false));
             let mut nid = tray_nid(hwnd);
@@ -203,12 +209,14 @@ impl TrayIcon {
     }
 
     fn remove_icon(hwnd: HWND) {
+// SAFETY: 同上；NIM_DELETE 只按 hwnd + uID 删除图标，nid 不需要图标句柄。
         unsafe {
             let nid = tray_nid(hwnd);
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         }
     }
 
+// SAFETY: Windows 消息循环按注册时的签名回调本函数；hwnd 是注册窗口，wparam/lparam 按各消息约定解释，本函数不把它们当 Rust 引用。
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         msg: u32,
@@ -256,9 +264,10 @@ impl TrayIcon {
     }
 
     fn refresh_icon_for_theme_change() {
+// SAFETY: 同 install——只在窗口线程处理 WM_SETTINGCHANGE 时读写 TRAY_HWND；TRAY_IS_ASCII 已改成原子量，跨线程读的是 load。
         unsafe {
             if let Some(hwnd) = TRAY_HWND {
-                let is_ascii = TRAY_IS_ASCII;
+                let is_ascii = TRAY_IS_ASCII.load(Ordering::Acquire);
                 let hicon = load_icon_from_ico(get_icon_for_mode(is_ascii));
                 let tip_str = if is_ascii { "EN\0" } else { "中\0" };
                 let mut nid = tray_nid(hwnd);
@@ -283,6 +292,7 @@ impl TrayIcon {
     }
 
     fn show_context_menu() {
+// SAFETY: 菜单/窗口句柄由本线程持有；TrackPopupMenu 阻塞期间菜单对象不被释放，PostMessageW 只投递 WM_NULL。
         unsafe {
             if let (Some(hwnd), Some(menu)) = (TRAY_HWND, TRAY_MENU) {
                 Self::build_menu(menu);
@@ -308,6 +318,7 @@ impl TrayIcon {
 
     /// 调 provider 求值当前方案开关（provider 未设置时为空）。
     fn provider_switch_items() -> Vec<SwitchMenuItem> {
+// SAFETY: 在窗口线程读 static mut 引用；provider 调用期间引用有效（install 之后、cleanup 之前），不跨调用保存。
         let Some(provider) = (unsafe {
             #[allow(static_mut_refs)]
             TRAY_SWITCH_PROVIDER.as_ref()
@@ -320,6 +331,7 @@ impl TrayIcon {
     /// 重建整份托盘菜单：固定项 + 当前方案 switches 动态分组（每次弹出
     /// 菜单时求值，方案切换 / 开关状态变化即时反映）。
     fn build_menu(menu: HMENU) {
+// SAFETY: menu 是 install 创建的 HMENU，调用期间存活；各 label 的 Vec<u16> 在对应 AppendMenuW 返回前不释放。
         unsafe {
             // 清空旧项。
             while GetMenuItemCount(Some(menu)) > 0 {
@@ -405,6 +417,7 @@ impl TrayIcon {
     }
 
     fn handle_menu_command(cmd: u32) {
+// SAFETY: 只在窗口线程处理 WM_COMMAND 时调用，对 TRAY_ON_ACTION 的读写与 install/cleanup 同线程；TRAY_SWITCH_ITEMS 另有 Mutex。
         unsafe {
             if let Some(ref on_action) = TRAY_ON_ACTION {
                 if cmd >= MENU_ID_SWITCH_BASE {
@@ -436,13 +449,15 @@ impl TrayIcon {
     }
 }
 
-/// 更新托盘图标状态（中/英）
+/// 更新托盘图标状态（中/英）。从 IPC 线程调用，所以句柄走原子量而不是 `static mut`。
 pub fn update_tray_icon(is_ascii: bool) {
-    unsafe {
-        TRAY_IS_ASCII = is_ascii;
-        if let Some(hwnd) = TRAY_HWND {
+    TRAY_IS_ASCII.store(is_ascii, Ordering::Release);
+    let raw = TRAY_HWND_RAW.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: 句柄是本进程的托盘窗口；PostMessageW 只把消息投进它的队列，不碰 Rust 侧内存。
+        unsafe {
             let _ = PostMessageW(
-                Some(hwnd),
+                Some(HWND(raw as *mut core::ffi::c_void)),
                 WM_TRAY_UPDATE,
                 WPARAM(if is_ascii { 1 } else { 0 }),
                 LPARAM(0),
@@ -452,6 +467,7 @@ pub fn update_tray_icon(is_ascii: bool) {
 }
 
 fn do_update_icon(is_ascii: bool) {
+// SAFETY: 只在窗口线程处理 WM_TRAY_UPDATE；TRAY_HWND 由本线程写，hicon 归系统所有，nid 调用期间有效。
     unsafe {
         if let Some(hwnd) = TRAY_HWND {
             let hicon = load_icon_from_ico(get_icon_for_mode(is_ascii));
@@ -465,16 +481,24 @@ fn do_update_icon(is_ascii: bool) {
     }
 }
 
-/// 显示托盘图标（当前 owner TIP 激活时）。
+/// 显示托盘图标（当前 owner TIP 激活时）。从 IPC 线程调用，句柄走原子量。
 pub fn show_icon() {
-    unsafe {
-        if let Some(hwnd) = TRAY_HWND {
-            let _ = PostMessageW(Some(hwnd), WM_TRAY_SHOW, WPARAM(0), LPARAM(0));
+    let raw = TRAY_HWND_RAW.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: 句柄是本进程的托盘窗口；PostMessageW 只把消息投进它的队列。
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(raw as *mut core::ffi::c_void)),
+                WM_TRAY_SHOW,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
     }
 }
 
 fn do_show_icon() {
+// SAFETY: 只在窗口线程处理 WM_TRAY_SHOW；dwState/dwStateMask 按 NIS_HIDDEN 约定填写。
     unsafe {
         if let Some(hwnd) = TRAY_HWND {
             let mut nid = tray_nid(hwnd);
@@ -486,16 +510,24 @@ fn do_show_icon() {
     }
 }
 
-/// 隐藏托盘图标（owner TIP 确认切到其他输入法产品时）。
+/// 隐藏托盘图标（owner TIP 确认切到其他输入法产品时）。从 IPC 线程调用，句柄走原子量。
 pub fn hide_icon() {
-    unsafe {
-        if let Some(hwnd) = TRAY_HWND {
-            let _ = PostMessageW(Some(hwnd), WM_TRAY_HIDE, WPARAM(0), LPARAM(0));
+    let raw = TRAY_HWND_RAW.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: 句柄是本进程的托盘窗口；PostMessageW 只把消息投进它的队列。
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(raw as *mut core::ffi::c_void)),
+                WM_TRAY_HIDE,
+                WPARAM(0),
+                LPARAM(0),
+            );
         }
     }
 }
 
 fn do_hide_icon() {
+// SAFETY: 只在窗口线程处理 WM_TRAY_HIDE；与 do_show_icon 对称，只改 NIS_HIDDEN 位。
     unsafe {
         if let Some(hwnd) = TRAY_HWND {
             let mut nid = tray_nid(hwnd);
@@ -508,6 +540,7 @@ fn do_hide_icon() {
 }
 
 /// 清理托盘图标和窗口（消息循环退出后调用）
+// SAFETY: 消息循环退出后由主线程调用；窗口/菜单句柄仍有效，销毁顺序与 install 相反（先窗口后菜单），并把原子句柄清零。
 pub fn cleanup() {    unsafe {
         if let Some(hwnd) = TRAY_HWND {
             let nid = tray_nid(hwnd);
@@ -526,6 +559,7 @@ pub fn cleanup() {    unsafe {
 }
 
 fn load_icon_from_ico(ico_data: &[u8]) -> HICON {
+// SAFETY: 先校验 len 与 image_offset+image_size 再切片；切片只在函数内存活，CreateIconFromResource 只读不持有。
     unsafe {
         if ico_data.len() < 22 {
             return LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
@@ -549,6 +583,7 @@ fn load_icon_from_ico(ico_data: &[u8]) -> HICON {
 }
 
 fn is_system_light_theme() -> bool {
+// SAFETY: hkey 仅在 RegOpenKeyExW 成功后使用，RegCloseKey 恰好调用一次；data/data_size 与 RRF_RT_DWORD 匹配。
     unsafe {
         let subkey: Vec<u16> =
             "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"

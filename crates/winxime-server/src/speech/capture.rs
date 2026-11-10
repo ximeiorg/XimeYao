@@ -58,6 +58,8 @@ impl Capture {
     ///
     /// 调用线程需已初始化 COM（server 的语音工作线程为 MTA）。
     pub fn open() -> Result<Self, String> {
+        // SAFETY: 调用线程已按函数文档初始化 COM；以下接口指针都由 windows crate 的智能指针
+        // 持有，GetMixFormat 返回的内存在解析与 Initialize 之后立刻 CoTaskMemFree，不跨出本块。
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -115,6 +117,7 @@ impl Capture {
     pub fn read_chunk(&self) -> Result<Vec<f32>, String> {
         let mut out = Vec::new();
         loop {
+            // SAFETY: capture 由成功的 GetService 取得，&self 保证它在本调用期间存活。
             let packet = unsafe {
                 self.capture
                     .GetNextPacketSize()
@@ -126,6 +129,8 @@ impl Capture {
             let mut data: *mut u8 = std::ptr::null_mut();
             let mut frames: u32 = 0;
             let mut flags: u32 = 0;
+            // SAFETY: 同一轮只取一个包；data 的有效期到下面的 ReleaseBuffer 为止，期间只按
+            // frames × 声道数 × 每样本字节数读取，不越过这一区间。
             unsafe {
                 self.capture
                     .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
@@ -140,10 +145,12 @@ impl Capture {
                     let bytes = frames as usize
                         * self.channels as usize
                         * self.format.bytes_per_sample();
+                    // SAFETY: 上面已确认 data 非空；设备保证这 bytes 字节在 ReleaseBuffer 前可读。
                     let slice = unsafe { std::slice::from_raw_parts(data, bytes) };
                     out.extend(mix_down_to_mono_f32(slice, self.format, self.channels));
                 }
             }
+            // SAFETY: 与本轮 GetBuffer 严格配对（每个非零包一次），frames 取自同一块缓冲。
             unsafe {
                 self.capture
                     .ReleaseBuffer(frames)
@@ -156,6 +163,8 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        // SAFETY: client 只在 open 成功后才被放进 self，Drop 时仍有效；Stop 失败被忽略，
+        // 接口的 Release 由智能指针负责。
         unsafe {
             let _ = self.client.Stop();
         }
@@ -166,10 +175,16 @@ impl Drop for Capture {
 ///
 /// 只接受 32bit 浮点与 16bit 整数（共享模式混音格式的实际取值）；
 /// 其余位数明确报错，避免按错误步长解读缓冲。
+///
+/// # Safety
+///
+/// `ptr` 必须非空，且指向一块在调用期间可读的 `WAVEFORMATEX`（采集链路里由
+/// `IAudioClient::GetMixFormat` 提供，并在 `CoTaskMemFree` 之前调用）。
 unsafe fn parse_mix_format(ptr: *const WAVEFORMATEX) -> Result<(SampleFormat, u16, i32), String> {
     if ptr.is_null() {
         return Err("混音格式指针为空".to_string());
     }
+    // SAFETY: 调用方按 # Safety 保证 ptr 有效；非空已在上一行检查，结构体在这段时间内不移动。
     let fmt = unsafe { &*ptr };
     let format = match (fmt.wFormatTag, fmt.wBitsPerSample) {
         (WAVE_FORMAT_IEEE_FLOAT, _) => SampleFormat::F32,
@@ -273,6 +288,7 @@ mod tests {
             wBitsPerSample: 32,
             cbSize: 0,
         };
+        // SAFETY: 指向本函数栈上的 WAVEFORMATEX，在本调用期间一直有效。
         let parsed = unsafe { parse_mix_format(&float32) };
         assert_eq!(parsed.map_err(|e| e.to_string()), Ok((SampleFormat::F32, 2, 48_000)));
 
@@ -285,9 +301,11 @@ mod tests {
             wBitsPerSample: 24,
             cbSize: 0,
         };
+        // SAFETY: 同上，指向栈上的 pcm24。
         assert!(unsafe { parse_mix_format(&pcm24) }.is_err());
 
         // 空指针与非零声道兜底
+        // SAFETY: 这里刻意传空指针，函数在解引用前就返回错误。
         assert!(unsafe { parse_mix_format(std::ptr::null()) }.is_err());
         let zero_channels = WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
@@ -295,6 +313,7 @@ mod tests {
             nSamplesPerSec: 48_000,
             ..Default::default()
         };
+        // SAFETY: 指向栈上的 zero_channels，在本调用期间有效。
         assert!(unsafe { parse_mix_format(&zero_channels) }.is_err());
     }
 }
