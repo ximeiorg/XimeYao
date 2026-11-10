@@ -25,7 +25,7 @@
 - P3a（U-7 前半）：模型包下载 512 MiB 硬上限、解压单文件 512 MiB / 合计 1 GiB，失败清理半成品；已机检，待发布前用真实包验证一次。
 - P1b（U-5 后半）：词典导出/导入/恢复的路径白名单。会动 `winxime-ipc` 协议与 `libximecore` 的 `xime-setup`（导出路径改由服务端生成），按规则需用户同意；用户 2026-11-09 表示暂不做。
 - P3b（U-7 后半）：注册表加 `ModelChecksum`，下载流式算摘要、先校验后解压、暂存后整体替换；专家评审已过、用户已批准范围，机检通过。剩 rev pin（等 core 合入）与真实包端到端。
-- P5（F7）批次 1：`text_input_processor.rs` 27 处 `unsafe` 补 26 块 SAFETY 注释（仅注释，不改行为）；余下托盘、语音采集、UI 绘制、tsf-register 按批次 2–4 继续。
+- P5（F7）批次 1：`text_input_processor.rs` 27 处 `unsafe` 补 26 块 SAFETY 注释（仅注释，不改行为）。批次 2：`tray.rs` 21 处补注释，并把三个跨线程入口的句柄与中英状态改为原子量（`D-006`）。余下语音采集、UI 绘制、tsf-register 按批次 3–4 继续。
 
 ## 已完成
 
@@ -43,6 +43,7 @@
 | 2026-11-09 | P3b：`ModelChecksum` 内置摘要、下载边写边算、先校验后解压、暂存后整体替换，含 13 条单测（`eac49f0`，rev pin 未做） | [2026-11-09-speech-package-checksum.md](docs/verify/2026-11-09-speech-package-checksum.md) |
 | 2026-11-09 | 本批改动本地提交（未 push）：`2b57fac` IPC、`8284a4b` 插件、`eac49f0` 语音、`6aeed27` 文档；libximecore 摘要字段 `bf3b9ae` | `git 2b57fac..6aeed27`、`core bf3b9ae` |
 | 2026-11-09 | P5 批次 1：TSF 回调 27 处 `unsafe` 补 26 块 SAFETY 注释（仅注释） | [2026-11-09-unsafe-tsf.md](docs/verify/2026-11-09-unsafe-tsf.md) |
+| 2026-11-10 | P5 批次 2：托盘 21 处 `unsafe` 补注释；跨线程句柄与中英状态改原子量（`D-006`） | [2026-11-10-unsafe-tray.md](docs/verify/2026-11-10-unsafe-tray.md) |
 | 2026-10-29 | 版本 0.3.2；合并 upstream（删除 builtin-extra，不再分发 librime 默认方案） | `git 09ab350` |
 | 2026-10-27 | 托盘 owner 常驻、F1–F23 交还宿主、数字后回车提交 | `git eb9582a` |
 | 2026-10-27 | 内置方案 seed 管理、导入方案、删除下载包 | `git 7976083` |
@@ -81,6 +82,6 @@
 
 - P3b 收尾：把 libximecore 的 `bf3b9ae` 推到 `ximeiorg/libximecore`，再给 8 个依赖钉 `rev`；之后用真实模型包走一次下载。
 - P1b 等用户点头（要动 `libximecore` 的 `xime-setup` 与 IPC 协议）。
-- P5 批次 2：托盘与线程（`tray.rs` 20 处），再依次语音采集、UI 绘制、`tsf-register`。
+- P5 批次 3：语音采集（`speech/capture.rs` 12 处），再 UI 绘制与 `tsf-register`。
 - P1a / P2 / P3a 待实机：P1a 按档案 4 步；P2 接线后拿真实备份包；P3a、P3b 用真实模型包下载一次。
 - 本机构建先设 `CC=CXX=clang-cl` 与 LLVM `PATH`，再跑 `cargo build --quiet`。
