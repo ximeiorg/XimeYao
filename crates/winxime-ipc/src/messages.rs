@@ -2,8 +2,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
+    /// 插入点左边界（物理像素，屏幕坐标）。
     pub x: i32,
+    /// 插入点所在行的下沿（物理像素，屏幕坐标）。
     pub y: i32,
+    /// 插入点所在行的高度（物理像素）。候选栏靠它决定「贴着光标往下放」还是
+    /// 「翻到光标上方」，旧版 TSF 不带这个字段，server 端按 `#[serde(default)]`
+    /// 收到 0，由布局层回落到默认行高。
+    #[serde(default)]
+    pub height: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -125,6 +132,13 @@ pub enum IpcCommand {
     EndSession,
     ProcessKeyEvent,
     UpdateInputPosition,
+    /// 宿主（TSF）侧组词串被外部终止（典型：用户在应用内点了别处，应用收掉
+    /// 组词串）。单向通知：服务端收到后要放弃影子缓冲的空闲提交，否则 2.5 秒
+    /// 兜底线程会把数字注到**新光标位置**（数字该留在原来的输入点）。
+    CompositionTerminated,
+    /// 面板快捷键（默认 Ctrl+`）在 TSF 侧被识别，请求候选栏展开/收起面板。
+    /// 单向通知：面板状态只在服务端 UI 线程，没有任何要回的内容。
+    TogglePanel,
     FocusIn,
     FocusOut,
     SelectCandidate,
@@ -197,10 +211,14 @@ impl IpcCommand {
     /// 而且完全不报错。新增单向命令必须同时改这里、服务端 `handle_connection` 的
     /// 跳过分支和客户端 [`crate::IpcClient::send_no_reply`] 的调用点。
     ///
-    /// 目前只有位置上报：它每次按键都发，坐标是「尽力而为」，等应答纯属浪费一个
-    /// 完整往返。
+    /// 目前只有位置上报、组词串终止通知与面板快捷键：位置每次按键都发，坐标是
+    /// 「尽力而为」，等应答纯属浪费一个完整往返；终止通知发生在宿主收掉组词串
+    /// 的瞬间，服务端没有任何需要回的东西；面板开关同样只是「转投窗口消息」。
     pub fn is_one_way(&self) -> bool {
-        matches!(self, Self::UpdateInputPosition)
+        matches!(
+            self,
+            Self::UpdateInputPosition | Self::CompositionTerminated | Self::TogglePanel
+        )
     }
 }
 
@@ -420,7 +438,7 @@ pub fn get_pipe_path() -> String {
 mod tests {
     use super::IpcCommand;
 
-    /// 单向命令（服务端不回包）只允许是位置上报。
+    /// 单向命令（服务端不回包）只允许是位置上报与组词串终止通知。
     ///
     /// 这个测试的主要作用是**反向约束**：回包命令一旦被登记成单向，服务端就不写应答，
     /// 客户端却还在等；反过来（登记漏了）则应答堆在管道里被下一条请求读走。
@@ -428,6 +446,8 @@ mod tests {
     #[test]
     fn only_position_update_is_one_way() {
         assert!(IpcCommand::UpdateInputPosition.is_one_way());
+        assert!(IpcCommand::CompositionTerminated.is_one_way());
+        assert!(IpcCommand::TogglePanel.is_one_way());
         // 典型的回包命令：按键、会话、开关、退出、配置、语音状态。
         for command in [
             IpcCommand::Echo,

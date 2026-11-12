@@ -25,7 +25,7 @@ use windows_core::{w, HSTRING};
 
 use super::glyph::{self, GlyphKind};
 use super::model::CandidateModel;
-use super::PanelPaintState;
+use super::{BLUR_RADIUS, PanelPaintState};
 use crate::speech::SpeechState;
 
 // ── 布局常量（与 macOS 版 candidate_window.rs 对齐，单位为 DIP）──
@@ -36,10 +36,10 @@ pub(crate) const MENU_BUTTON_GAP: f32 = 4.0;
 pub(crate) const MENU_STRIP_HEIGHT: f32 = 16.0;
 /// 面板区高：布局 = 标题栏 36 + 间距 8 + 4 行条目×32（行距 4）+ 间距 8 + 底部区 32 + 底边距 8。
 // 面板高度收紧到内容实际需要：菜单页顶部 10 + 3 行卡片 104 + 间距 8
-// + 品牌栏 32 + 底边距 8 = 162（菜单页无标题栏，子页面内容少、此高度足够）。
-const PANEL_HEIGHT: f32 = 162.0;
+// + 底边距 8 = 130（品牌栏已移除；菜单页无标题栏，子页面内容少、此高度足够）。
+const PANEL_HEIGHT: f32 = 130.0;
 /// 面板区与候选区之间的间距。
-const PANEL_GAP: f32 = 4.0;
+pub(crate) const PANEL_GAP: f32 = 4.0;
 /// 面板标题栏高度。
 const PANEL_HEADER_HEIGHT: f32 = 36.0;
 /// 面板行统一高度：菜单卡片 / 底部入口条同高。
@@ -293,9 +293,10 @@ fn panel_menu_row_y(i: usize) -> f32 {
     PANEL_MENU_TOP + i as f32 * (PANEL_ITEM_HEIGHT + PANEL_ROW_GAP)
 }
 
-/// 底部入口条（菜单页品牌栏）的 y。
+/// 菜单内容区的下界：品牌栏已按用户要求移除（版权/主页信息只在关于页展示），
+/// 底部只留面板下边距。
 fn panel_footer_y() -> f32 {
-    PANEL_HEIGHT - PANEL_BOTTOM_MARGIN - PANEL_ITEM_HEIGHT
+    PANEL_HEIGHT - PANEL_BOTTOM_MARGIN
 }
 
 /// 面板高度（按页面）：菜单页为收紧后的 198；列表子页按可见条目数 + 翻页条扩展；
@@ -309,9 +310,38 @@ pub(crate) fn panel_height(page: PanelPage) -> f32 {
     }
 }
 
-/// 面板展开时相对候选栏增加的窗口高度（DIP）。
-pub(crate) fn panel_extra_height(page: PanelPage) -> f32 {
-    PANEL_GAP + panel_height(page)
+/// 面板相对候选栏的展开方向。
+///
+/// 由候选栏排列方向决定（用户要求的 U-14）：
+/// 横向候选栏（⋮ 在左）→ 面板展开在**上方**；纵向候选栏（⋯ 在顶）→ 面板展开在**右侧**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PanelSide {
+    /// 面板在候选栏上方（候选条带被推到窗口底部）。
+    Above,
+    /// 面板在候选栏右侧。
+    Right,
+}
+
+/// 按候选栏排列方向取面板展开方向。
+pub(crate) fn panel_side(horizontal: bool) -> PanelSide {
+    if horizontal {
+        PanelSide::Above
+    } else {
+        PanelSide::Right
+    }
+}
+
+/// 面板在窗口客户区（DIP）里的左上角原点。
+///
+/// - `Above`：面板占窗口顶部，候选条带被推到下方——面板 y = `blur_radius`，
+///   候选条带顶 = `blur_radius + panel_height + PANEL_GAP`。
+/// - `Right`：面板贴在候选栏右侧——面板 x = `blur_radius + bar_width + PANEL_GAP`，
+///   y = `blur_radius`。
+pub(crate) fn panel_origin(side: PanelSide, bar_width: f32) -> (f32, f32) {
+    match side {
+        PanelSide::Above => (BLUR_RADIUS, BLUR_RADIUS),
+        PanelSide::Right => (BLUR_RADIUS + bar_width + PANEL_GAP, BLUR_RADIUS),
+    }
 }
 
 /// 列表子页的一行：全文 + 触发编码（剪切板历史无编码，快捷发送条目可带编码）。
@@ -1128,21 +1158,23 @@ pub(crate) fn panel_hit(
 }
 
 /// 把窗口客户区 DIP 坐标换算为面板内坐标；点不在面板区域内时返回 None。
-/// `blur_radius` 为窗口四周阴影留白，`bar_height` 为候选栏自身高度，
-/// `panel_height` 为当前页面板高度（见 [`panel_height`]）。
+/// `bar_width` 为候选栏自身宽度（Right 侧面板贴在它右边），
+/// `panel_width`/`panel_height` 为当前页面板尺寸（见 [`panel_height`]），
+/// `side` 决定面板贴在候选栏哪一侧（见 [`PanelSide`]）。
 pub(crate) fn window_to_panel(
-    blur_radius: f32,
-    bar_height: f32,
+    bar_width: f32,
     panel_width: f32,
     panel_height: f32,
+    side: PanelSide,
     x: f32,
     y: f32,
 ) -> Option<(f32, f32)> {
-    if panel_width <= 0.0 {
+    if panel_width <= 0.0 || panel_height <= 0.0 {
         return None;
     }
-    let lx = x - blur_radius;
-    let ly = y - (blur_radius + bar_height + PANEL_GAP);
+    let (origin_x, origin_y) = panel_origin(side, bar_width);
+    let lx = x - origin_x;
+    let ly = y - origin_y;
     if lx >= 0.0 && lx <= panel_width && ly >= 0.0 && ly <= panel_height {
         Some((lx, ly))
     } else {
@@ -1179,21 +1211,26 @@ fn make_text_format(
     }
 }
 
-/// 绘制候选栏下方的菜单面板（布局与 macOS 版一致：标题栏 + 2 列卡片 + 底部品牌栏）。
-/// 面板内坐标均为 panel-local，绘制时加上面板原点偏移。
+/// 绘制面板（布局与 macOS 版一致：标题栏 + 2 列功能卡片）。
+/// `side` 决定面板贴在候选栏哪一侧：横向候选栏画在上方、纵向画在右侧（U-14）。
+/// 面板内坐标均为 panel-local，绘制时加上面板原点偏移（见 [`panel_origin`]）。
 /// 列表子页（剪切板 / 快捷发送）读 `list`（内存快照，见 [`PanelList`]）；
 /// 网格子页（表情 / 符号）读 `grid`（当前标签 / 页 / 最近使用，见 [`PanelGrid`]）
 /// 加内置字形表（见 `ui::glyph`）。
-// 10 个参数都是绘制上下文 + 三份页面数据；收成一个结构体要连带动 `paint`
-// 的调用链，属技术债 D（巨函数拆分）范围，这里先放行。
+/// 面板滑入距离（DIP）：展开/收起动画里面板相对终位的最大偏移。
+pub(crate) const PANEL_ANIM_SLIDE_DIP: f32 = 12.0;
+
+// 11 个参数都是绘制上下文 + 三份页面数据 + 动画进度；收成一个结构体要连带动
+// `paint` 的调用链，属技术债 D（巨函数拆分）范围，这里先放行。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_panel(
     d2d: &ID2D1DeviceContext,
     dwrite: &IDWriteFactory1,
     model: &CandidateModel,
-    blur_radius: f32,
     panel_width: f32,
-    bar_height: f32,
+    bar_width: f32,
+    side: PanelSide,
+    progress: f32,
     state: PanelPaintState,
     list: &PanelList,
     grid: &PanelGrid,
@@ -1202,9 +1239,18 @@ pub(crate) fn draw_panel(
     let page = state.page;
     let hovered_item = state.hovered_item;
     unsafe {
-        let panel_y = blur_radius + bar_height + PANEL_GAP;
-        let panel_left = blur_radius;
-        let panel_right = blur_radius + panel_width;
+        // 动画：可见度 alpha（0=全透明）+ 从候选栏「长出来」的滑入位移。
+        // 展开与收起共用同一公式——收起就是 progress 从 1 倒放回 0。
+        let alpha = progress.clamp(0.0, 1.0);
+        let slide = (1.0 - alpha) * PANEL_ANIM_SLIDE_DIP;
+        let (mut panel_left, mut panel_y) = panel_origin(side, bar_width);
+        // Above：面板在候选栏上方，从下方（候选栏位置）向上滑入；
+        // Right：面板在候选栏右侧，从左方（候选栏位置）向右滑入。
+        match side {
+            PanelSide::Above => panel_y += slide,
+            PanelSide::Right => panel_left -= slide,
+        }
+        let panel_right = panel_left + panel_width;
         let panel_height = panel_height(page);
         let radius = 8.0;
 
@@ -1215,7 +1261,7 @@ pub(crate) fn draw_panel(
                     r: 0.92,
                     g: 0.92,
                     b: 0.94,
-                    a: 0.96,
+                    a: 0.96 * alpha,
                 },
                 None,
             )
@@ -1234,7 +1280,15 @@ pub(crate) fn draw_panel(
 
         let fg = model.fg_color;
         let text_brush = d2d
-            .CreateSolidColorBrush(&fg, None)
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                    a: fg.a * alpha,
+                },
+                None,
+            )
             .map_err(|e| format!("CreateSolidColorBrush panel_text failed: {:?}", e))?;
         let secondary_brush = d2d
             .CreateSolidColorBrush(
@@ -1242,7 +1296,7 @@ pub(crate) fn draw_panel(
                     r: fg.r,
                     g: fg.g,
                     b: fg.b,
-                    a: 0.55,
+                    a: 0.55 * alpha,
                 },
                 None,
             )
@@ -1253,7 +1307,7 @@ pub(crate) fn draw_panel(
                     r: fg.r,
                     g: fg.g,
                     b: fg.b,
-                    a: 0.06,
+                    a: 0.06 * alpha,
                 },
                 None,
             )
@@ -1264,7 +1318,7 @@ pub(crate) fn draw_panel(
                     r: model.highlight_bg_color.r,
                     g: model.highlight_bg_color.g,
                     b: model.highlight_bg_color.b,
-                    a: 0.15,
+                    a: 0.15 * alpha,
                 },
                 None,
             )
@@ -1275,7 +1329,7 @@ pub(crate) fn draw_panel(
                     r: fg.r,
                     g: fg.g,
                     b: fg.b,
-                    a: 0.06,
+                    a: 0.06 * alpha,
                 },
                 None,
             )
@@ -1284,10 +1338,26 @@ pub(crate) fn draw_panel(
         // 错误红、以及最淡的提示行。面板底色是浅色硬编码（见上），
         // 所以错误红也用固定的高对比红，不跟主题走。
         let accent_brush = d2d
-            .CreateSolidColorBrush(&model.highlight_bg_color, None)
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: model.highlight_bg_color.r,
+                    g: model.highlight_bg_color.g,
+                    b: model.highlight_bg_color.b,
+                    a: model.highlight_bg_color.a * alpha,
+                },
+                None,
+            )
             .map_err(|e| format!("CreateSolidColorBrush panel_accent failed: {:?}", e))?;
         let on_accent_brush = d2d
-            .CreateSolidColorBrush(&model.highlight_fg_color, None)
+            .CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: model.highlight_fg_color.r,
+                    g: model.highlight_fg_color.g,
+                    b: model.highlight_fg_color.b,
+                    a: model.highlight_fg_color.a * alpha,
+                },
+                None,
+            )
             .map_err(|e| format!("CreateSolidColorBrush panel_on_accent failed: {:?}", e))?;
         let error_brush = d2d
             .CreateSolidColorBrush(
@@ -1295,7 +1365,7 @@ pub(crate) fn draw_panel(
                     r: 0.90,
                     g: 0.28,
                     b: 0.23,
-                    a: 1.0,
+                    a: 1.0 * alpha,
                 },
                 None,
             )
@@ -1306,7 +1376,7 @@ pub(crate) fn draw_panel(
                     r: fg.r,
                     g: fg.g,
                     b: fg.b,
-                    a: 0.40,
+                    a: 0.40 * alpha,
                 },
                 None,
             )
@@ -1317,7 +1387,7 @@ pub(crate) fn draw_panel(
                     r: fg.r,
                     g: fg.g,
                     b: fg.b,
-                    a: 0.14,
+                    a: 0.14 * alpha,
                 },
                 None,
             )
@@ -1492,7 +1562,7 @@ pub(crate) fn draw_panel(
 
         match page {
             PanelPage::Menu => {
-                // 菜单页：2 列功能入口卡片（行高/行距与 macOS 版一致），底部品牌栏补齐版面。
+                // 菜单页：2 列功能入口卡片（行高/行距与 macOS 版一致）。
                 // 卡片图标为 emoji 字符：候选字体（中文）没有 emoji 字形，会渲染成方框；
                 // 必须用系统 emoji 字体 + 彩色字形选项（Win10+）。
                 let emoji_family = HSTRING::from("Segoe UI Emoji");
@@ -1567,30 +1637,6 @@ pub(crate) fn draw_panel(
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
                 }
-
-                // 品牌栏：占据底部入口条分区（非交互），与 macOS 版一致。
-                let brand_hstring = HSTRING::from("曦码·曜输入法");
-                let brand_format = make_text_format(
-                    dwrite,
-                    &model.font_family,
-                    model.font_size - 2.0,
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
-                    true,
-                )?;
-                d2d.DrawText(
-                    &brand_hstring,
-                    &brand_format,
-                    &D2D_RECT_F {
-                        left: panel_left,
-                        top: panel_y + panel_footer_y(),
-                        right: panel_right,
-                        bottom: panel_y + panel_footer_y() + PANEL_ITEM_HEIGHT,
-                    },
-                    &secondary_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
             }
             page => {
                 // 子页面：标题（粗体）+ 返回按钮；内容按页面分支（剪切板为历史列表，其余占位）。
@@ -2062,7 +2108,7 @@ pub(crate) fn draw_panel(
                         );
                     }
                     _ => {
-                        // 其它功能页面（v1 占位）：占位内容居中于标题栏与品牌栏之间。
+                        // 其它功能页面（v1 占位）：占位内容居中于标题栏与面板底部之间。
                         let placeholder_hstring = HSTRING::from("功能开发中");
                         let rows_top = PANEL_HEADER_HEIGHT + PANEL_CONTENT_GAP;
                         let rows_bottom = panel_footer_y() - PANEL_ROW_GAP;
@@ -2195,7 +2241,7 @@ mod tests {
 
     #[test]
     fn menu_rows_fit_above_footer() {
-        // 最后一行菜单卡片不得与底部品牌栏重叠。
+        // 最后一行菜单卡片不得越过面板底部边距。
         let last_row_bottom = panel_menu_row_y(2) + PANEL_ITEM_HEIGHT;
         assert!(last_row_bottom <= panel_footer_y() - PANEL_ROW_GAP);
         // 顶部不留大空白：首行紧贴菜单页顶部留白之下。
@@ -2251,38 +2297,71 @@ mod tests {
     fn window_to_panel_maps_inside_and_outside() {
         let blur = 8.0;
         let bar_h = 30.0;
+        let bar_w = 200.0;
         let menu_h = panel_height(PanelPage::Menu);
-        // 候选栏区域内不算面板。
+        // 横向候选栏：面板在上方，候选栏区域内（面板高 + 间距之下）不算面板。
         assert!(
-            window_to_panel(blur, bar_h, 320.0, menu_h, 100.0, blur + bar_h / 2.0).is_none(),
+            window_to_panel(
+                bar_w,
+                320.0,
+                menu_h,
+                PanelSide::Above,
+                100.0,
+                blur + menu_h + PANEL_GAP + bar_h / 2.0,
+            )
+            .is_none(),
             "bar area must not map to panel"
         );
-        // 面板首行内可命中，返回面板内坐标。
+        // 面板首行内可命中，返回面板内坐标（面板在上方：面板顶 = blur_radius）。
         let (lx, ly) = window_to_panel(
-            blur,
-            bar_h,
+            bar_w,
             320.0,
             menu_h,
+            PanelSide::Above,
             blur + 10.0,
-            blur + bar_h + PANEL_GAP + 5.0,
+            blur + 5.0,
         )
         .unwrap();
         assert!((lx - 10.0).abs() < 1e-4);
         assert!((ly - 5.0).abs() < 1e-4);
         // 面板高度按页面：菜单页之下、剪切板页之内的点只在剪切板页命中。
-        let low_y = blur + bar_h + PANEL_GAP + menu_h + 1.0;
-        assert!(window_to_panel(blur, bar_h, 320.0, menu_h, blur + 10.0, low_y).is_none());
+        let low_y = blur + menu_h + 1.0;
+        assert!(window_to_panel(bar_w, 320.0, menu_h, PanelSide::Above, blur + 10.0, low_y).is_none());
         assert!(window_to_panel(
-            blur,
-            bar_h,
+            bar_w,
             320.0,
             panel_height(PanelPage::Clipboard),
+            PanelSide::Above,
             blur + 10.0,
             low_y,
         )
         .is_some());
+        // 纵向候选栏：面板在右侧，候选栏区域内不算面板；面板首行可命中。
+        assert!(
+            window_to_panel(
+                bar_w,
+                320.0,
+                menu_h,
+                PanelSide::Right,
+                blur + bar_w / 2.0,
+                blur + menu_h / 2.0,
+            )
+            .is_none(),
+            "vertical bar area must not map to panel"
+        );
+        let (lx, ly) = window_to_panel(
+            bar_w,
+            320.0,
+            menu_h,
+            PanelSide::Right,
+            blur + bar_w + PANEL_GAP + 10.0,
+            blur + 5.0,
+        )
+        .unwrap();
+        assert!((lx - 10.0).abs() < 1e-4);
+        assert!((ly - 5.0).abs() < 1e-4);
         // 面板宽度无效时不命中。
-        assert!(window_to_panel(blur, bar_h, 0.0, menu_h, 100.0, 100.0).is_none());
+        assert!(window_to_panel(bar_w, 0.0, menu_h, PanelSide::Above, 100.0, 100.0).is_none());
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub fn notify_titled(title: &str, body: String) {
 
     match verdict {
         Verdict::Send => {
-            tracing::info!("通知: {title} — {body}");
+            tracing::debug!("通知: {title} — {body}");
             crate::toast::show_toast(title, &body);
         }
         Verdict::Duplicate => {

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use xime_plugin::{PluginManager, PluginManifest, PluginRecordState, PluginRuntime, RemoteBackupEntry};
 use xime_p2p::Event;
 
@@ -464,7 +464,7 @@ impl PluginHost {
 
     /// 本地剪贴板变化：转交剪贴板同步线程（hash 去重后经插件推送到远端）。
     pub fn clipboard_local_changed(&self, text: &str) {
-        info!("剪贴板变化进入宿主: {} 字符", text.len());
+        trace!("剪贴板变化进入宿主: {} 字符", text.len());
         self.send_clipboard(ClipboardCommand::LocalChanged(text.to_string()));
     }
 
@@ -653,7 +653,9 @@ fn run_clipboard_worker(
     while let Ok(cmd) = rx.recv() {
         match cmd {
             ClipboardCommand::LocalChanged(text) => {
-                info!("worker 收到剪贴板变化: {} 字符", text.len());
+                // 剪贴板变化是高频事件：worker 内部流转走 trace（U-10），
+                // 只保留「启动/停止/失败」这类结果级 info。
+                trace!("worker 收到剪贴板变化: {} 字符", text.len());
                 let hash = sha256_hex(text.as_bytes());
                 if current.as_deref() == Some(hash.as_str()) {
                     continue;
@@ -666,7 +668,7 @@ fn run_clipboard_worker(
                 record_history(&db_path, &text);
                 if let Some(sync) = &p2p {
                     if sync.push_text(&text) {
-                        info!("局域网直连已投递 ({} 字符)", text.chars().count());
+                        trace!("局域网直连已投递 ({} 字符)", text.chars().count());
                     }
                 }
                 let profile = serde_json::json!({
@@ -681,7 +683,7 @@ fn run_clipboard_worker(
                 if let Some(rt) = &runtime {
                     if rt.clipboard_push(&profile) {
                         last_pushed = Some(hash);
-                        info!("剪贴板已推送 ({} 字符)", text.len());
+                        trace!("剪贴板已推送 ({} 字符)", text.len());
                     } else {
                         warn!(
                             "剪贴板推送失败: 同步插件={} ({} 字符)",
@@ -739,7 +741,7 @@ fn run_clipboard_worker(
                 // 剪贴板面板）；写回触发的本地回声已被 self_written 抑制，不会重复
                 record_history(&db_path, &text);
                 if crate::clipboard::write_text(&text) {
-                    info!("远端剪贴板已写回本地 ({} 字符)", text.len());
+                    trace!("远端剪贴板已写回本地 ({} 字符)", text.len());
                 }
             }
             ClipboardCommand::Shutdown => {
@@ -785,7 +787,7 @@ fn handle_p2p_event(
             *current = Some(sha256_hex(text.as_bytes()));
             record_history(db_path, &text);
             if crate::clipboard::write_text(&text) {
-                info!("局域网直连收到远端剪贴板 ({} 字符)", text.chars().count());
+                trace!("局域网直连收到远端剪贴板 ({} 字符)", text.chars().count());
             } else {
                 warn!("局域网直连收到远端剪贴板，但写回系统剪贴板失败");
             }
@@ -817,7 +819,7 @@ fn record_history(db_path: &Path, text: &str) {
     {
         warn!("剪贴板历史写入失败: {}", e);
     } else {
-        info!("剪贴板历史已记录");
+        trace!("剪贴板历史已记录");
     }
 }
 

@@ -18,11 +18,10 @@ use std::sync::Arc;
 use tracing::{error, info, trace, warn};
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    HWND_TOPMOST, PostMessageW, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, WM_USER,
-};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 use winxime_ipc::Context;
 
+use self::layout::Placement;
 use self::model::{CandidateModel, RenderedMetrics, RootModel};
 use self::panel::{PanelGrid, PanelList, PanelPage, VoiceView};
 use self::view::RenderedView;
@@ -30,10 +29,22 @@ use crate::recent_usage;
 
 pub const WM_SHOW_CANDIDATE: u32 = WM_USER + 1;
 pub const WM_HIDE_CANDIDATE: u32 = WM_USER + 2;
-pub const WM_UPDATE_CANDIDATE: u32 = WM_USER + 3;
-pub const WM_SET_POSITION: u32 = WM_USER + 4;
 pub const WM_SHOW_ROOT: u32 = WM_USER + 5;
 pub const WM_HIDE_ROOT: u32 = WM_USER + 6;
+/// 面板快捷键触发：展开/收起面板（含动画）。IPC 线程投递，UI 线程处理。
+pub const WM_TOGGLE_PANEL: u32 = WM_USER + 7;
+
+/// 一次「显示 / 刷新候选栏」的完整载荷：定位锚点 + 要显示的内容。
+///
+/// 锚点和内容必须走同一条消息。分成两条（先定位、再更新内容）时，同一轮刷新
+/// 会摆两次窗口：先按**旧**尺寸摆一次，再按新尺寸摆一次。候选数从 3 变成 10
+/// 时窗口高度差好几百 DIP，这两次之间的位移就是用户看到的「忽上忽下 / 闪」。
+pub(crate) struct ShowRequest {
+    /// `(插入点左边, 插入行下沿, 插入行高度)`，物理像素。
+    pub(crate) anchor: (i32, i32, i32),
+    /// 本次要显示的输入上下文（候选、组词串、高亮等）。
+    pub(crate) context: Context,
+}
 
 /// 共享布局常量（DIP）：layout / paint / view 共用。
 pub(crate) const ROW_SPACING: f32 = 4.0;
@@ -65,6 +76,46 @@ pub struct CandidateWindow {
     pub(crate) voice_timer: Cell<bool>,
     /// 最近一次布局结果（用于 ⋮ 按钮/面板/候选命中测试）。
     pub(crate) metrics: RefCell<Option<RenderedMetrics>>,
+    /// 候选栏定位锚点：`(插入点左边, 插入行下沿, 插入行高度)`，物理像素。
+    ///
+    /// 由 TSF 每次按键上报，`show` 时转存到这里；之后所有重排（面板展开、
+    /// 切页、字根窗显示/收起、DPI 变化）都拿它重新择位，因此窗口挪到哪
+    /// 不再依赖「上一次 SetWindowPos 留下的坐标」。
+    pub(crate) anchor: Cell<Option<(i32, i32, i32)>>,
+    /// 上一次择位的结果（`None` = 还没摆过）。
+    ///
+    /// 用途是「高度变了但别乱动」：候选数在几个到十个之间跳，窗口高度跟着跳，
+    /// 但插入点没动、原位又放得下时就不要挪窗口（见 `layout::place_window_sticky`）。
+    pub(crate) placement: Cell<Option<Placement>>,
+    /// 面板展开/收起动画的进行状态（`None` = 没有动画在跑）。
+    pub(crate) panel_anim: Cell<Option<PanelAnim>>,
+    /// 面板动画定时器是否已开（防止重复 SetTimer）。
+    pub(crate) panel_anim_timer: Cell<bool>,
+}
+
+/// 面板展开/收起动画状态：方向 + 当前帧（`0..=total_frames`）。
+///
+/// 展开时进度 0→1（淡入 + 滑入），收起时 1→0（淡出 + 滑出），
+/// 播完由定时器分支收尾（收起时才真正收窗）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PanelAnim {
+    /// true = 展开动画（面板从无到有），false = 收起动画。
+    pub(crate) expanding: bool,
+    pub(crate) frame: u32,
+    pub(crate) total_frames: u32,
+}
+
+impl PanelAnim {
+    /// 线性进度 0.0~1.0。
+    pub(crate) fn linear(&self) -> f32 {
+        self.frame as f32 / self.total_frames.max(1) as f32
+    }
+
+    /// ease-out 进度（三次方缓出）：起步快、收尾柔。
+    pub(crate) fn progress(&self) -> f32 {
+        let t = self.linear();
+        1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
+    }
 }
 
 /// 面板绘制状态（面板展开时为 Some）：页面 + hover 元素下标。
@@ -100,10 +151,22 @@ impl CandidateWindow {
     }
 
     /// 收起面板并复位到菜单页（输入新内容/隐藏候选栏时调用）。
+    ///
+    /// 注意：这只改状态不清定时器——收起动画播完后的收尾也走这里（那时动画
+    /// 已清）；中途打断动画（隐藏候选栏等）由调用方先 `cancel_panel_anim`。
     pub(crate) fn collapse_panel(&self) {
         self.panel_visible.set(false);
         self.panel_page.set(PanelPage::Menu);
         self.hovered_item.set(None);
+    }
+
+    /// 面板当前可见度（0.0~1.0）：没有动画时恒为 1.0；收起动画按 1→0 倒放。
+    pub(crate) fn panel_progress(&self) -> f32 {
+        match self.panel_anim.get() {
+            None => 1.0,
+            Some(anim) if anim.expanding => anim.progress(),
+            Some(anim) => 1.0 - anim.progress(),
+        }
     }
 
     /// 重载列表子页数据（进入「剪切板」/「快捷发送」时调用一次：UI 线程内一次 SQLite
@@ -155,6 +218,10 @@ impl CandidateWindow {
             voice: RefCell::new(VoiceView::default()),
             voice_timer: Cell::new(false),
             metrics: RefCell::new(None),
+            anchor: Cell::new(None),
+            placement: Cell::new(None),
+            panel_anim: Cell::new(None),
+            panel_anim_timer: Cell::new(false),
         });
 
         // Initialize UI immediately in the thread that will run message loop
@@ -178,26 +245,40 @@ impl CandidateWindow {
         }
     }
 
-    pub fn show(&self, x: i32, y: i32) {
+    /// 显示（或刷新）候选栏：定位锚点与要显示的内容一起交给 UI 线程。
+    ///
+    /// `anchor` 是 `(插入点左边, 插入行下沿, 插入行高度)`，物理像素。这里不再
+    /// 自己做任何偏移：真正的择位（贴下方 / 下方不够翻上方 / 夹进工作区）由
+    /// UI 线程在拿到最新布局尺寸后统一算，见 `view::RenderedView::set_size_and_place`。
+    ///
+    /// 锚点与上下文合并在一条消息里，是因为分开投递会让同一轮刷新摆两次窗口：
+    /// 先按旧尺寸摆、再按新尺寸摆，候选数跳变时这段位移就是用户看到的闪烁。
+    pub fn show(&self, anchor: (i32, i32, i32), ctx: &Context) {
         self.ensure_view_initialized();
         if let Some(view) = self.view.borrow().as_ref() {
             trace!(
-                "show: hwnd={:?}, moving to ({}, {})",
+                "show: hwnd={:?}, anchor=({}, {}, h={}), {} 个候选",
                 view.hwnd.0,
-                x,
-                y + 24
+                anchor.0,
+                anchor.1,
+                anchor.2,
+                ctx.candidates.candies.len()
             );
             unsafe {
-                let _ = SetWindowPos(
-                    view.hwnd,
-                    Some(HWND_TOPMOST),
-                    x,
-                    y + 24,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE,
+                let req_ptr = Box::into_raw(Box::new(ShowRequest {
+                    anchor,
+                    context: ctx.clone(),
+                }));
+                let result = PostMessageW(
+                    Some(view.hwnd),
+                    WM_SHOW_CANDIDATE,
+                    WPARAM(req_ptr as usize),
+                    LPARAM(0),
                 );
-                let result = PostMessageW(Some(view.hwnd), WM_SHOW_CANDIDATE, WPARAM(0), LPARAM(0));
+                if result.is_err() {
+                    let _ = Box::from_raw(req_ptr);
+                    warn!("show: WM_SHOW_CANDIDATE 投递失败，已释放请求内存");
+                }
                 trace!("show: PostMessageW result: {:?}", result);
             }
         } else {
@@ -213,25 +294,14 @@ impl CandidateWindow {
         }
     }
 
-    pub fn update(&self, ctx: &Context) {
+    /// 面板快捷键入口：把「切换面板」投到候选栏窗口（UI 线程处理，含动画）。
+    ///
+    /// 从 IPC 线程调用（`ipc_server::handle_toggle_panel`）。
+    pub fn post_toggle_panel(&self) {
         if let Some(view) = self.view.borrow().as_ref() {
-            trace!("update: hwnd={:?}, posting WM_UPDATE_CANDIDATE", view.hwnd.0);
             unsafe {
-                let ctx_ptr = Box::into_raw(Box::new(ctx.clone()));
-                let result = PostMessageW(
-                    Some(view.hwnd),
-                    WM_UPDATE_CANDIDATE,
-                    WPARAM(ctx_ptr as usize),
-                    LPARAM(0),
-                );
-                trace!("update: PostMessageW result: {:?}", result);
-                if result.is_err() {
-                    let _ = Box::from_raw(ctx_ptr);
-                    warn!("update: WM_UPDATE_CANDIDATE 投递失败，已释放上下文内存");
-                }
+                let _ = PostMessageW(Some(view.hwnd), WM_TOGGLE_PANEL, WPARAM(0), LPARAM(0));
             }
-        } else {
-            warn!("update: 候选栏视图尚未初始化");
         }
     }
 
@@ -263,5 +333,47 @@ impl CandidateWindow {
                 let _ = PostMessageW(Some(view.hwnd), WM_HIDE_ROOT, WPARAM(0), LPARAM(0));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PanelAnim;
+
+    #[test]
+    fn panel_anim_progress_is_ease_out_and_bounded() {
+        let anim = PanelAnim {
+            expanding: true,
+            frame: 0,
+            total_frames: 8,
+        };
+        assert!((anim.progress() - 0.0).abs() < 1e-4, "首帧进度应为 0");
+
+        let mid = PanelAnim { frame: 4, ..anim };
+        let half = mid.progress();
+        assert!(half > 0.5, "ease-out 前半段应过半（起步快）：{half}");
+
+        let done = PanelAnim { frame: 8, ..anim };
+        assert!((done.progress() - 1.0).abs() < 1e-4, "末帧进度应为 1");
+        // 单调不减：进度随帧递增。
+        let mut prev = 0.0;
+        for frame in 0..=8 {
+            let a = PanelAnim { frame, ..anim };
+            let p = a.progress();
+            assert!(p >= prev - 1e-4, "进度应单调不减：frame={frame} p={p}");
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn panel_anim_total_frames_zero_does_not_divide_by_zero() {
+        let anim = PanelAnim {
+            expanding: false,
+            frame: 0,
+            total_frames: 0,
+        };
+        // total_frames 为 0 时 max(1) 兜底，不得 panic、进度应落在 0~1。
+        let p = anim.progress();
+        assert!((0.0..=1.0).contains(&p), "进度应落在 0~1：{p}");
     }
 }

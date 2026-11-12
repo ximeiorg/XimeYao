@@ -1,6 +1,6 @@
 use librime::{get_key_modifiers, K_ALT_MASK, K_CONTROL_MASK, K_SHIFT_MASK};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
@@ -25,6 +25,9 @@ const VK_OEM_PLUS: u16 = 0xBB;
 const VK_OEM_2: u16 = 0xBF;
 const VK_OEM_5: u16 = 0xDC;
 const VK_OEM_3: u16 = 0xC0;
+/// 面板快捷键修饰键：Ctrl（TF_PRESERVEDKEY.uModifiers 用 TSF 的 TF_MOD_* 语义，
+/// TF_MOD_CONTROL = 0x0002）。
+const TF_MOD_CONTROL: u32 = 0x0002;
 
 const GUID_LBI_INPUTMODE: GUID = GUID::from_u128(0x5D5D8287_5B53_4DAA_B44C_52EB4794A3E7);
 
@@ -62,30 +65,30 @@ impl IpcClientHandle {
     }
 
     pub fn connect(&self) -> std::result::Result<(), winxime_ipc::IpcError> {
-        debug!("IpcClientHandle::connect() called");
+        trace!("IpcClientHandle::connect() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                debug!("  -> lock would block, returning error");
+                trace!("  -> lock would block, returning error");
                 return Err(winxime_ipc::IpcError::ConnectionFailed(
                     "lock would block".to_string(),
                 ));
             }
         };
         if guard.client.is_some() {
-            debug!("  -> already connected");
+            trace!("  -> already connected");
             return Ok(());
         }
-        debug!("  -> calling IpcClient::connect()");
+        trace!("  -> calling IpcClient::connect()");
         let client = IpcClient::connect()?;
-        debug!("  -> IpcClient::connect() succeeded");
+        trace!("  -> IpcClient::connect() succeeded");
         guard.client = Some(client);
         Ok(())
     }
 
     pub fn disconnect(&self) {
-        debug!("IpcClientHandle::disconnect() called");
+        trace!("IpcClientHandle::disconnect() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -111,7 +114,7 @@ impl IpcClientHandle {
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                debug!("start_session: lock failed");
+                trace!("start_session: lock failed");
                 return (0, None);
             }
         };
@@ -121,7 +124,7 @@ impl IpcClientHandle {
                 session_id: 0,
                 data: IpcRequestData::None,
             };
-            debug!("start_session: sending request, session_id=0");
+            trace!("start_session: sending request, session_id=0");
             match client.send_request(&request) {
                 Ok(response) => {
                     debug!(
@@ -143,7 +146,7 @@ impl IpcClientHandle {
                 }
             }
         } else {
-            debug!("start_session: no client");
+            trace!("start_session: no client");
         }
         (guard.session_id, None)
     }
@@ -152,7 +155,7 @@ impl IpcClientHandle {
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                debug!("process_key: lock failed, returning None");
+                trace!("process_key: lock failed, returning None");
                 return None;
             }
         };
@@ -165,7 +168,7 @@ impl IpcClientHandle {
             };
             match client.send_request(&request) {
                 Ok(response) => {
-                    debug!("process_key: got response, success={}", response.success);
+                    trace!("process_key: got response, success={}", response.success);
                     return Some(response);
                 }
                 Err(e) => {
@@ -216,7 +219,7 @@ impl IpcClientHandle {
         }
     }
 
-    pub fn update_position(&self, x: i32, y: i32) {
+    pub fn update_position(&self, x: i32, y: i32, height: i32) {
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -226,7 +229,7 @@ impl IpcClientHandle {
             let request = IpcRequest {
                 command: IpcCommand::UpdateInputPosition,
                 session_id,
-                data: IpcRequestData::Position(Position { x, y }),
+                data: IpcRequestData::Position(Position { x, y, height }),
             };
             let _ = client.send_no_reply(&request);
         }
@@ -251,11 +254,11 @@ impl IpcClientHandle {
     }
 
     pub fn focus_in(&self) {
-        debug!("IPC::focus_in() called");
+        trace!("IPC::focus_in() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                debug!("  -> lock failed, skipping focus_in");
+                trace!("  -> lock failed, skipping focus_in");
                 return;
             }
         };
@@ -266,23 +269,74 @@ impl IpcClientHandle {
                 session_id,
                 data: IpcRequestData::None,
             };
-            debug!("  -> sending FocusIn request (session_id={})", session_id);
+            trace!("  -> sending FocusIn request (session_id={})", session_id);
             if client.send_oneway(&request).is_ok() {
-                debug!("  -> FocusIn sent successfully");
+                trace!("  -> FocusIn sent successfully");
             } else {
-                debug!("  -> FocusIn send FAILED");
+                trace!("  -> FocusIn send FAILED");
             }
         } else {
-            debug!("  -> no client, cannot send FocusIn");
+            trace!("  -> no client, cannot send FocusIn");
+        }
+    }
+
+    /// 组词串被宿主终止：单向通知 server 放弃影子缓冲的空闲提交。
+    ///
+    /// 场景：自动识别把数字挂进组词串后，用户在应用里点了别处，应用收掉组词串
+    /// （TSF 回调 `OnCompositionTerminated`）。数字已留在原文档，server 的 2.5 秒
+    /// 兜底线程若不知道这件事，会把同一份数字再插到点击处的新光标上。
+    /// `send_no_reply` 只写不读；连接断了就静默放弃（下一位按键会重连）。
+    pub fn notify_composition_terminated(&self) {
+        let mut guard = match self.state.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                trace!("  -> lock failed, skipping composition-terminated notify");
+                return;
+            }
+        };
+        let session_id = guard.session_id;
+        if let Some(ref mut client) = guard.client {
+            let request = IpcRequest {
+                command: IpcCommand::CompositionTerminated,
+                session_id,
+                data: IpcRequestData::None,
+            };
+            if let Err(e) = client.send_no_reply(&request) {
+                trace!("  -> composition-terminated notify failed: {e}");
+            }
+        }
+    }
+
+    /// 面板快捷键命中：单向通知 server 切换候选栏面板（展开/收起）。
+    ///
+    /// `send_no_reply` 只写不读；连接断了就静默放弃（下一次热键会重连）。
+    pub fn notify_toggle_panel(&self) {
+        let mut guard = match self.state.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                trace!("  -> lock failed, skipping toggle-panel notify");
+                return;
+            }
+        };
+        let session_id = guard.session_id;
+        if let Some(ref mut client) = guard.client {
+            let request = IpcRequest {
+                command: IpcCommand::TogglePanel,
+                session_id,
+                data: IpcRequestData::None,
+            };
+            if let Err(e) = client.send_no_reply(&request) {
+                trace!("  -> toggle-panel notify failed: {e}");
+            }
         }
     }
 
     pub fn focus_out(&self) -> Option<IpcResponse> {
-        debug!("IPC::focus_out() called");
+        trace!("IPC::focus_out() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                debug!("  -> lock failed, skipping focus_out");
+                trace!("  -> lock failed, skipping focus_out");
                 return None;
             }
         };
@@ -293,26 +347,26 @@ impl IpcClientHandle {
                 session_id,
                 data: IpcRequestData::None,
             };
-            debug!("  -> sending FocusOut request (session_id={})", session_id);
+            trace!("  -> sending FocusOut request (session_id={})", session_id);
             match client.send_request(&request) {
                 Ok(response) => {
-                    debug!("  -> FocusOut response received");
+                    trace!("  -> FocusOut response received");
                     Some(response)
                 }
                 Err(e) => {
-                    debug!("  -> FocusOut send FAILED: {:?}", e);
+                    trace!("  -> FocusOut send FAILED: {:?}", e);
                     None
                 }
             }
         } else {
-            debug!("  -> no client, cannot send FocusOut");
+            trace!("  -> no client, cannot send FocusOut");
             None
         }
     }
 
     /// 把当前 TIP 实例认领为托盘 owner（只在语言产品激活/激活时调用）。
     pub fn show_tray_icon(&self, session_id: u32) {
-        debug!("IPC::show_tray_icon(session_id={session_id})");
+        trace!("IPC::show_tray_icon(session_id={session_id})");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -329,7 +383,7 @@ impl IpcClientHandle {
 
     /// 只有 owner 才会真正隐藏服务端托盘；非 owner 的调用由 server 忽略。
     pub fn hide_tray_icon(&self, session_id: u32) {
-        debug!("IPC::hide_tray_icon(session_id={session_id})");
+        trace!("IPC::hide_tray_icon(session_id={session_id})");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -345,7 +399,7 @@ impl IpcClientHandle {
     }
 
     pub fn hide_candidates(&self) {
-        debug!("IPC::hide_candidates() called");
+        trace!("IPC::hide_candidates() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -357,22 +411,22 @@ impl IpcClientHandle {
                 session_id,
                 data: IpcRequestData::None,
             };
-            debug!(
+            trace!(
                 "  -> sending HideCandidates request (session_id={})",
                 session_id
             );
             if client.send_oneway(&request).is_ok() {
-                debug!("  -> HideCandidates sent successfully");
+                trace!("  -> HideCandidates sent successfully");
             } else {
-                debug!("  -> HideCandidates send FAILED");
+                trace!("  -> HideCandidates send FAILED");
             }
         } else {
-            debug!("  -> no client");
+            trace!("  -> no client");
         }
     }
 
     pub fn show_root(&self, letter: char) {
-        debug!("IPC::show_root() called, letter={}", letter);
+        trace!("IPC::show_root() called, letter={}", letter);
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -384,19 +438,19 @@ impl IpcClientHandle {
                 session_id,
                 data: IpcRequestData::ShowRoot(letter),
             };
-            debug!("  -> sending ShowRoot request");
+            trace!("  -> sending ShowRoot request");
             if client.send_oneway(&request).is_ok() {
-                debug!("  -> ShowRoot sent successfully");
+                trace!("  -> ShowRoot sent successfully");
             } else {
-                debug!("  -> ShowRoot send FAILED");
+                trace!("  -> ShowRoot send FAILED");
             }
         } else {
-            debug!("  -> no client");
+            trace!("  -> no client");
         }
     }
 
     pub fn hide_root(&self) {
-        debug!("IPC::hide_root() called");
+        trace!("IPC::hide_root() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -408,14 +462,14 @@ impl IpcClientHandle {
                 session_id,
                 data: IpcRequestData::None,
             };
-            debug!("  -> sending HideRoot request");
+            trace!("  -> sending HideRoot request");
             if client.send_oneway(&request).is_ok() {
-                debug!("  -> HideRoot sent successfully");
+                trace!("  -> HideRoot sent successfully");
             } else {
-                debug!("  -> HideRoot send FAILED");
+                trace!("  -> HideRoot send FAILED");
             }
         } else {
-            debug!("  -> no client");
+            trace!("  -> no client");
         }
     }
 }
@@ -440,7 +494,7 @@ impl RimeOutput {
     fn from_response(response: &IpcResponse) -> Self {
         let ctx = response.context.as_ref();
         let commit = ctx.and_then(|c| c.commit.clone());
-        debug!(
+        trace!(
             "RimeOutput::from_response: context={}, commit={:?}, preedit='{}'",
             ctx.is_some(),
             commit,
@@ -461,6 +515,17 @@ impl RimeOutput {
     }
 }
 
+/// 插入点锚点：`(左边, 所在行下沿, 所在行高度)`，物理像素屏幕坐标。
+///
+/// 候选栏靠它决定「贴光标下方」还是「翻到光标上方」，行高为 0 表示没量到。
+type CaretAnchor = (i32, i32, i32);
+
+/// 会话内量到、会话外发送的插入点槽位。
+///
+/// TSF 编辑会话期间握着文档写锁，不能同步等 IPC 进程；所以量到的坐标先落进
+/// 这个槽位，会话结束后由调用方取走再发（见 `send_pending_position`）。
+type PendingCaret = std::sync::Mutex<Option<CaretAnchor>>;
+
 #[implement(ITfEditSession)]
 struct XimeEditSession {
     output: RimeOutput,
@@ -474,15 +539,17 @@ struct XimeEditSession {
     flush_commit: bool,
     composition: Arc<std::sync::Mutex<Option<ITfComposition>>>,
     composition_sink: ITfCompositionSink,
-    /// 编辑会话里量到的插入点坐标。**不在会话里发 IPC**：TSF 编辑会话期间拿着
-    /// 文档写锁，同步等另一个进程（最坏 1 秒）会把宿主（Office / 浏览器）一起拖住。
-    /// 会话结束后由调用方取走再发。
-    position: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    /// 编辑会话里量到的插入点（左边 / 下沿 / 行高）。**不在会话里发 IPC**：TSF
+    /// 编辑会话期间拿着文档写锁，同步等另一个进程（最坏 1 秒）会把宿主
+    /// （Office / 浏览器）一起拖住。会话结束后由调用方取走再发。
+    position: Arc<PendingCaret>,
 }
 
 #[implement(ITfCompositionSink)]
 struct CompositionSink {
     composition: Arc<std::sync::Mutex<Option<ITfComposition>>>,
+    /// 组词串被宿主终止时通知 server（放弃影子缓冲的空闲提交）。
+    ipc: IpcClientHandle,
 }
 
 impl ITfCompositionSink_Impl for CompositionSink_Impl {
@@ -491,19 +558,23 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         _ecwrite: u32,
         _pcomposition: Ref<'_, ITfComposition>,
     ) -> Result<()> {
-        debug!("OnCompositionTerminated: composition terminated");
+        trace!("OnCompositionTerminated: composition terminated");
         match self.composition.try_lock() {
             Ok(mut guard) => *guard = None,
             Err(std::sync::TryLockError::Poisoned(e)) => *e.into_inner() = None,
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
+        // server 侧此刻可能还攥着影子缓冲的 2.5s 空闲提交线程；数字已随组词串
+        // 终止留在原文档，再注入 F24 就会重复一份、且落在点击处的新光标上。
+        // 单向通知让它立刻作废（失焦路径有专门的旧 context 提交，不走这里）。
+        self.ipc.notify_composition_terminated();
         Ok(())
     }
 }
 
 impl ITfEditSession_Impl for XimeEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        debug!(
+        trace!(
             "DoEditSession: ec={}, commit={}, composing={}, preedit='{}'",
             ec,
             self.output.commit.is_some(),
@@ -518,7 +589,7 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
 
                     Some(t) => unsafe { t.GetFocus() }?,
                     None => {
-                        debug!("DoEditSession: no thread_mgr and no target context");
+                        trace!("DoEditSession: no thread_mgr and no target context");
                         return Ok(());
                     }
                 };
@@ -526,14 +597,14 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
                 unsafe { doc_mgr.GetBase() }?
             }
         };
-        debug!("DoEditSession: got context");
+        trace!("DoEditSession: got context");
 
         // Handle commit and composition (weasel pattern)
         let commit_text = self.output.commit.clone().unwrap_or_default();
         let preedit_text = self.output.preedit.clone();
 
         if !commit_text.is_empty() {
-            debug!("DoEditSession: COMMIT '{}'", commit_text);
+            trace!("DoEditSession: COMMIT '{}'", commit_text);
 
             // If not composing, start a composition for the commit
             let has_comp = match self.composition.try_lock() {
@@ -543,18 +614,18 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
             if self.flush_commit && !has_comp {
                 // 失焦 flush 的组词串已经被 TSF 终止：终止时文本留在文档里，
                 // 这里再插入就是第二份。直接跳过。
-                debug!("DoEditSession: flush skipped (composition already terminated)");
+                trace!("DoEditSession: flush skipped (composition already terminated)");
                 return Ok(());
             }
             if !has_comp {
-                debug!("DoEditSession: creating composition for commit");
+                trace!("DoEditSession: creating composition for commit");
                 self.start_composition(&context, ec, "");
             }
 
             // Set commit text and end composition (clear=false to keep text)
             self.update_composition_text(&context, ec, &commit_text);
             self.end_composition(ec);
-            debug!("DoEditSession: commit done");
+            trace!("DoEditSession: commit done");
         }
 
         // Handle composing state changes and inline preedit update
@@ -563,16 +634,16 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
             Err(_) => false,
         };
         if self.output.composing && !has_comp {
-            debug!("DoEditSession: start composition '{}'", preedit_text);
+            trace!("DoEditSession: start composition '{}'", preedit_text);
             self.start_composition(&context, ec, &preedit_text);
         } else if self.output.composing && !preedit_text.is_empty() {
-            debug!(
+            trace!(
                 "DoEditSession: update composition text '{}' (has_comp={})",
                 preedit_text, has_comp
             );
             self.update_composition_text(&context, ec, &preedit_text);
         } else if !self.output.composing && has_comp {
-            debug!("DoEditSession: clear text and end composition");
+            trace!("DoEditSession: clear text and end composition");
             self.update_composition_text(&context, ec, "");
             self.end_composition(ec);
         }
@@ -584,7 +655,7 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
 impl XimeEditSession_Impl {
     /// 在编辑会话里量插入点坐标（`GetTextExt` 需要有效的 `ec`，只能在会话内做），
     /// 但**不在会话里发 IPC**——同步等待另一个进程期间，文档写锁一直握在我们手里。
-    fn caret_position_in_session(context: &ITfContext, ec: u32) -> Option<(i32, i32)> {
+    fn caret_position_in_session(context: &ITfContext, ec: u32) -> Option<(i32, i32, i32)> {
         use std::mem::ManuallyDrop;
         use std::ops::Deref;
 
@@ -604,11 +675,15 @@ impl XimeEditSession_Impl {
                             .GetTextExt(ec, sel_range, &mut rc, &mut clipped)
                             .is_ok()
                         {
-                            debug!(
-                                "caret_position_in_session: left={}, bottom={}",
-                                rc.left, rc.bottom
+                            trace!(
+                                "caret_position_in_session: left={}, bottom={}, height={}",
+                                rc.left,
+                                rc.bottom,
+                                rc.bottom - rc.top
                             );
-                            Some((rc.left, rc.bottom))
+                            // 顺带把插入行高度带出去：候选栏靠它决定「贴下方」
+                            // 的基准，也靠它判断翻到上方时该让多少空间。
+                            Some((rc.left, rc.bottom, rc.bottom - rc.top))
                         } else {
                             None
                         }
@@ -628,13 +703,13 @@ impl XimeEditSession_Impl {
     }
 
     fn start_composition(&self, context: &ITfContext, ec: u32, preedit: &str) {
-        debug!("start_composition: preedit='{}'", preedit);
+        trace!("start_composition: preedit='{}'", preedit);
         use windows::Win32::UI::TextServices::{ITfInsertAtSelection, TF_IAS_QUERYONLY};
 
         let insert_at_selection: ITfInsertAtSelection = match context.cast() {
             Ok(s) => s,
             Err(e) => {
-                debug!(
+                trace!(
                     "start_composition: cast ITfInsertAtSelection failed: {:?}",
                     e
                 );
@@ -645,7 +720,7 @@ impl XimeEditSession_Impl {
         let ctx_comp: ITfContextComposition = match context.cast() {
             Ok(c) => c,
             Err(e) => {
-                debug!(
+                trace!(
                     "start_composition: cast ITfContextComposition failed: {:?}",
                     e
                 );
@@ -658,28 +733,28 @@ impl XimeEditSession_Impl {
             let range = match insert_at_selection.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[]) {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!("start_composition: InsertTextAtSelection failed: {:?}", e);
+                    trace!("start_composition: InsertTextAtSelection failed: {:?}", e);
                     return;
                 }
             };
-            debug!("start_composition: got empty range");
+            trace!("start_composition: got empty range");
 
             match ctx_comp.StartComposition(ec, &range, Some(&self.composition_sink)) {
                 Ok(comp) => {
-                    debug!("start_composition: StartComposition succeeded");
+                    trace!("start_composition: StartComposition succeeded");
                     let comp_range = match comp.GetRange() {
                         Ok(r) => r,
                         Err(e) => {
-                            debug!("start_composition: GetRange failed: {:?}", e);
+                            trace!("start_composition: GetRange failed: {:?}", e);
                             return;
                         }
                     };
 
                     let wide: Vec<u16> = preedit.encode_utf16().collect();
-                    debug!("start_composition: setting text {} chars", wide.len());
+                    trace!("start_composition: setting text {} chars", wide.len());
                     match comp_range.SetText(ec, 0, &wide) {
                         Ok(_) => {
-                            debug!("start_composition: SetText succeeded, weasel mode");
+                            trace!("start_composition: SetText succeeded, weasel mode");
                             // Weasel: collapse to end, set selection with TF_AE_NONE
                             comp_range.Collapse(ec, TF_ANCHOR_END).ok();
                             use std::mem::ManuallyDrop;
@@ -714,23 +789,23 @@ impl XimeEditSession_Impl {
                             }
                         }
                         Err(e) => {
-                            debug!("start_composition: SetText failed: {:?}", e);
+                            trace!("start_composition: SetText failed: {:?}", e);
                         }
                     }
                 }
                 Err(e) => {
-                    debug!("start_composition: StartComposition failed: {:?}", e);
+                    trace!("start_composition: StartComposition failed: {:?}", e);
                 }
             }
         }
     }
 
     fn update_composition_text(&self, context: &ITfContext, ec: u32, preedit: &str) {
-        debug!("update_composition_text: preedit='{}'", preedit);
+        trace!("update_composition_text: preedit='{}'", preedit);
         let comp = match self.composition.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                debug!("update_composition_text: lock failed");
+                trace!("update_composition_text: lock failed");
                 return;
             }
         };
@@ -741,7 +816,7 @@ impl XimeEditSession_Impl {
                     let wide: Vec<u16> = preedit.encode_utf16().collect();
                     match range.SetText(ec, 0, &wide) {
                         Ok(_) => {
-                            debug!("update_composition_text: SetText succeeded");
+                            trace!("update_composition_text: SetText succeeded");
                             // Weasel: collapse to end, set selection with TF_AE_NONE
                             range.Collapse(ec, TF_ANCHOR_END).ok();
                             use std::mem::ManuallyDrop;
@@ -754,14 +829,14 @@ impl XimeEditSession_Impl {
                             };
                             context.SetSelection(ec, &[sel]).ok();
                         }
-                        Err(e) => debug!("update_composition_text: SetText failed: {:?}", e),
+                        Err(e) => trace!("update_composition_text: SetText failed: {:?}", e),
                     }
                 } else {
-                    debug!("update_composition_text: GetRange failed");
+                    trace!("update_composition_text: GetRange failed");
                 }
             }
         } else {
-            debug!("update_composition_text: no composition");
+            trace!("update_composition_text: no composition");
         }
     }
 
@@ -813,8 +888,6 @@ impl XimeTextService_Impl {
     }
 
     fn update_caret_position_sync(&self, context: &ITfContext) {
-        debug!("update_caret_position_sync: getting caret rect");
-
         use windows::Win32::Foundation::RECT;
         use windows::Win32::UI::TextServices::{
             ITfEditSession, TF_DEFAULT_SELECTION, TF_ES_ASYNCDONTCARE, TF_ES_READ,
@@ -859,10 +932,6 @@ impl XimeTextService_Impl {
                         let mut rc = RECT::default();
                         let mut clipped = BOOL::default();
                         view.GetTextExt(ec, sel_range, &mut rc, &mut clipped)?;
-                        debug!(
-                            "SelectionRect: left={}, top={}, right={}, bottom={}",
-                            rc.left, rc.top, rc.right, rc.bottom
-                        );
                         self.rect.set(rc);
                     }
 
@@ -886,14 +955,18 @@ impl XimeTextService_Impl {
         };
 
         let rect = session.rect();
-        debug!(
-            "update_caret_position_sync: left={}, bottom={}",
-            rect.left, rect.bottom
-        );
 
         if self.ipc.is_connected() {
-            self.ipc.update_position(rect.left, rect.bottom);
-            debug!("update_caret_position_sync: sent to server");
+            self.ipc
+                .update_position(rect.left, rect.bottom, rect.bottom - rect.top);
+            // 每键一次的光标上报只留一条 trace（含结果），排障够用；原 4 条
+            // debug 洪水（getting/SelectionRect/left/sent）已并入这里（U-10）。
+            trace!(
+                "update_caret_position_sync: left={}, bottom={}, height={}, sent",
+                rect.left,
+                rect.bottom,
+                rect.bottom - rect.top
+            );
         }
     }
 
@@ -912,12 +985,13 @@ impl XimeTextService_Impl {
         output: RimeOutput,
         flush_commit: bool,
     ) -> bool {
-        debug!("schedule_edit_session: called (flush={flush_commit})");
+        trace!("schedule_edit_session: called (flush={flush_commit})");
         let tid = self.client_id.get();
         let mgr = self.thread_mgr.borrow().clone();
 
         let composition_sink_impl = CompositionSink {
             composition: self.composition.clone(),
+            ipc: self.ipc.clone(),
         };
         let composition_sink: ITfCompositionSink = composition_sink_impl.into();
 
@@ -932,7 +1006,7 @@ impl XimeTextService_Impl {
             position: position.clone(),
         };
         let session_itf: ITfEditSession = session.into();
-        debug!(
+        trace!(
             "schedule_edit_session: tid={}, calling RequestEditSession",
             tid
         );
@@ -943,7 +1017,7 @@ impl XimeTextService_Impl {
                 &session_itf,
                 TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
             );
-            debug!(
+            trace!(
                 "schedule_edit_session: RequestEditSession result: {:?}",
                 result
             );
@@ -958,14 +1032,14 @@ impl XimeTextService_Impl {
     }
 
     /// 把编辑会话量到的插入点发给 server（没量到就不发）。
-    fn send_pending_position(&self, position: &Arc<std::sync::Mutex<Option<(i32, i32)>>>) {
+    fn send_pending_position(&self, position: &Arc<PendingCaret>) {
         let pending = match position.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
-        if let Some((x, y)) = pending {
+        if let Some((x, y, height)) = pending {
             if self.ipc.is_connected() {
-                self.ipc.update_position(x, y);
+                self.ipc.update_position(x, y, height);
             }
         }
     }
@@ -984,7 +1058,6 @@ impl XimeTextService_Impl {
         is_up: bool,
     ) -> bool {
         let code = vk.0;
-        debug!("process_key_event: vk={} is_up={}", code, is_up);
 
         // 服务进程自身的实例不处理任何按键（见 `self_host` 字段注释）。
         if self.self_host.get() {
@@ -999,7 +1072,7 @@ impl XimeTextService_Impl {
         // 路径上顺手收 composition，把 F2 重命名/F5 刷新吞掉。
         // F24（0x87）是内部上屏触发键，不能在这里放行。
         if is_function_passthrough(code) {
-            debug!("  -> function key, pass through to the app");
+            trace!("  -> function key, pass through to the app");
             return false;
         }
 
@@ -1010,23 +1083,23 @@ impl XimeTextService_Impl {
         {
             // 这条早退原来一声不响：用户报「只有英文字母」时，日志里看不出是英文态
             // 还是 TIP 根本没被调用。现在入口有 `process_key_event` 一行、这里有原因。
-            debug!("  -> ascii mode, key passed through to the app");
+            trace!("  -> ascii mode, key passed through to the app");
             return false;
         }
 
         if is_up {
             if !self.ipc.is_connected() {
-                debug!("  -> IPC not connected, skipping key up");
+                trace!("  -> IPC not connected, skipping key up");
                 return false;
             }
         } else {
             if !self.ipc.is_connected() {
-                debug!("  -> IPC not connected, attempting reconnect...");
+                trace!("  -> IPC not connected, attempting reconnect...");
                 if self.ipc.connect().is_ok() {
                     self.ipc.start_session();
-                    debug!("  -> Reconnected!");
+                    trace!("  -> Reconnected!");
                 } else {
-                    debug!("  -> Reconnect failed");
+                    trace!("  -> Reconnect failed");
                     return false;
                 }
             }
@@ -1040,22 +1113,23 @@ impl XimeTextService_Impl {
         if !is_up && (VK_X_A..=VK_X_Z).contains(&code) && mods == 0 {
             let letter = char::from_u32(code as u32 - VK_X_A as u32 + 'a' as u32).unwrap_or('a');
             self.last_input_key.set(Some(letter));
-            debug!("  -> recorded last_input_key: {}", letter);
+            trace!("  -> recorded last_input_key: {}", letter);
         }
 
         // Shift+可打印符号键按 X11 语义上报移位后的字符 keysym（Shift+/ → '?'），
         // 中文态标点（？、（、！等）依赖此转换
         let xk = vk_to_xk_with_shift(code, mods & K_SHIFT_MASK as i32 != 0);
-        debug!("  -> calling process_key({}, {})", xk, mods);
         let response = self.ipc.process_key(xk, mods);
-        debug!("  -> response: {:?}", response);
         if let Some(response) = response {
-            debug!("  -> success={}", response.success);
             let output = RimeOutput::from_response(&response);
+            // 每键只留这一条 trace：vk/xk/裁决/组词态一行看全（U-10）。
+            trace!(
+                "process_key_event: vk={} xk={} up={} handled={} composing={}",
+                code, xk, is_up, response.success, output.composing
+            );
             if response.success {
                 self.set_composing(output.composing);
                 if let Some(ctx) = context {
-                    debug!("  -> calling schedule_edit_session");
                     self.schedule_edit_session(ctx, output);
                 }
                 return true;
@@ -1070,7 +1144,7 @@ impl XimeTextService_Impl {
                 output.composing,
                 self.is_composing(),
             ) {
-                debug!("  -> rejected key: engine not composing, end stale composition");
+                trace!("  -> rejected key: engine not composing, end stale composition");
                 self.set_composing(false);
                 if let Some(ctx) = context {
                     self.schedule_edit_session(
@@ -1085,12 +1159,11 @@ impl XimeTextService_Impl {
                 }
             }
         }
-        debug!("  -> returning false");
         false
     }
 
     fn abort_composition(&self) {
-        debug!("abort_composition");
+        trace!("abort_composition");
         self.composing.set(false);
         // Release composition reference if held (OnCompositionTerminated will clean up TSF side)
         if let Ok(mut guard) = self.composition.try_lock() {
@@ -1103,7 +1176,7 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
     fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
         // Focus handling is done in ITfThreadMgrEventSink::OnSetFocus
         // to avoid redundant IPC calls from multiple TSF sinks.
-        debug!("ITfKeyEventSink::OnSetFocus - ignored (handled by ThreadMgrEventSink)");
+        trace!("ITfKeyEventSink::OnSetFocus - ignored (handled by ThreadMgrEventSink)");
         Ok(())
     }
 
@@ -1114,7 +1187,6 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
         _lparam: LPARAM,
     ) -> Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-        debug!("OnTestKeyDown: vk={}", vk.0);
         // 对齐 weasel：TestKeyDown 即完成整个按键处理（IPC 询问 rime），
         // OnKeyDown 只重放结果。
         self.test_keyup_pending.set(false);
@@ -1125,13 +1197,12 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
         if eaten {
             self.test_keydown_pending.set(true);
         }
-        debug!("  -> eaten: {}", eaten);
+        trace!("OnTestKeyDown: vk={}, eaten={}", vk.0, eaten);
         Ok(BOOL(if eaten { 1 } else { 0 }))
     }
 
     fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-        debug!("OnKeyDown: vk={}", vk.0);
 
         // Shift 单按判定：Shift 按下置位；期间任何其他键按下即取消
         if vk.0 == VK_SHIFT.0 {
@@ -1143,15 +1214,15 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
         if vk.0 == VK_CONTROL.0 {
             if self.is_composing() && !self.ctrl_root_visible.get() {
                 let last_key = self.last_input_key.get();
-                debug!("  -> Ctrl pressed while composing, last_key={:?}", last_key);
+                trace!("  -> Ctrl pressed while composing, last_key={:?}", last_key);
                 if let Some(letter) = last_key {
                     let mods = get_key_modifiers(false);
-                    debug!("  -> mods={}", mods);
+                    trace!("  -> mods={}", mods);
                     let ctrl_only = (mods & K_CONTROL_MASK as i32) != 0
                         && (mods & K_SHIFT_MASK as i32) == 0
                         && (mods & K_ALT_MASK as i32) == 0;
                     if ctrl_only {
-                        debug!("  -> sending ShowRoot for '{}'", letter);
+                        trace!("  -> sending ShowRoot for '{}'", letter);
                         self.ipc.show_root(letter);
                         self.ctrl_root_visible.set(true);
                     }
@@ -1169,7 +1240,7 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
         // 注释）——补走完整处理
         let context = pic.as_ref();
         let handled = self.process_key_event(context, vk, false);
-        debug!("  -> result: {}", handled);
+        trace!("OnKeyDown: vk={}, handled={}", vk.0, handled);
         Ok(BOOL(if handled { 1 } else { 0 }))
     }
 
@@ -1194,17 +1265,18 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
         if eaten {
             self.test_keyup_pending.set(true);
         }
-        debug!("OnTestKeyUp: vk={}, eaten={}", vk.0, eaten);
+        if eaten {
+            trace!("OnTestKeyUp: vk={}, eaten={}", vk.0, eaten);
+        }
         Ok(BOOL(if eaten { 1 } else { 0 }))
     }
 
     fn OnKeyUp(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-        debug!("OnKeyUp: vk={}", vk.0);
 
         if vk.0 == VK_CONTROL.0 {
             if self.ctrl_root_visible.get() {
-                debug!("  -> Ctrl released, sending HideRoot");
+                trace!("  -> Ctrl released, sending HideRoot");
                 self.ipc.hide_root();
                 self.ctrl_root_visible.set(false);
             }
@@ -1220,42 +1292,44 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
             }
             let context = pic.as_ref();
             let handled = self.process_key_event(context, vk, true);
-            debug!("  -> key up result: {}", handled);
+            if handled {
+                trace!("OnKeyUp: vk={}, handled={}", vk.0, handled);
+            }
             return Ok(BOOL(if handled { 1 } else { 0 }));
         }
 
         // 仅单按 Shift（按下与抬起之间无其他键活动）才切换中英；
         // Shift+符号键（如 Shift+/ 打 ？）不触发切换
         if !self.shift_solo.replace(false) {
-            debug!("  -> shift used with other key, skip ascii toggle");
+            trace!("  -> shift used with other key, skip ascii toggle");
             return Ok(BOOL(0));
         }
 
         if !self.ipc.is_connected() {
-            debug!("  -> IPC not connected");
+            trace!("  -> IPC not connected");
             return Ok(BOOL(0));
         }
 
-        debug!("  -> calling toggle_ascii_mode");
+        trace!("  -> calling toggle_ascii_mode");
         let response = self.ipc.toggle_ascii_mode();
-        debug!("  -> response: {:?}", response);
+        trace!("  -> response: {:?}", response);
 
         if let Some(response) = response {
             if response.success {
                 if let Some(ref status) = response.status {
-                    debug!(
+                    trace!(
                         "  -> server ascii_mode: {}, updating local",
                         status.ascii_mode
                     );
                     self.ascii_mode
                         .store(status.ascii_mode, std::sync::atomic::Ordering::Release);
                     let verify = self.ascii_mode.load(std::sync::atomic::Ordering::Acquire);
-                    debug!("  -> verified local ascii_mode: {}", verify);
+                    trace!("  -> verified local ascii_mode: {}", verify);
                     self.update_lang_bar();
                 }
 
                 let output = RimeOutput::from_response(&response);
-                debug!(
+                trace!(
                     "  -> output: commit={}, composing={}",
                     output.commit.is_some(),
                     output.composing
@@ -1263,14 +1337,14 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
                 self.set_composing(output.composing);
 
                 if output.commit.is_some() {
-                    debug!(
+                    trace!(
                         "  -> has commit, scheduling edit session to commit and end composition"
                     );
                     if let Some(ctx) = pic.as_ref() {
                         self.schedule_edit_session(ctx, output);
                     }
                 } else if !output.composing && self.is_composing() {
-                    debug!("  -> composing changed to false, ending composition");
+                    trace!("  -> composing changed to false, ending composition");
                     self.set_composing(false);
                     if let Some(ctx) = pic.as_ref() {
                         self.schedule_edit_session(
@@ -1292,7 +1366,14 @@ impl ITfKeyEventSink_Impl for XimeTextService_Impl {
         Ok(BOOL(0))
     }
 
-    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
+    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, rguid: *const GUID) -> Result<BOOL> {
+        // 面板快捷键（默认 Ctrl+`）：命中保留键 GUID 就让 TSF 吃掉按键并通知
+        // server 切换面板；其它保留键（无）不处理。
+        if !rguid.is_null() && unsafe { *rguid } == PANEL_HOTKEY_GUID {
+            trace!("panel hotkey pressed -> TogglePanel");
+            self.ipc.notify_toggle_panel();
+            return Ok(BOOL(1));
+        }
         Ok(BOOL(0))
     }
 }
@@ -1309,6 +1390,8 @@ pub struct XimeTextService {
     client_id: std::cell::Cell<u32>,
     ipc: IpcClientHandle,
     composing: std::cell::Cell<bool>,
+    /// 面板快捷键保留键是否已注册（注销时对称 UnpreserveKey）。
+    panel_hotkey_advised: std::cell::Cell<bool>,
     composition: Arc<std::sync::Mutex<Option<ITfComposition>>>,
     lang_bar_mgr: std::cell::RefCell<Option<ITfLangBarItemMgr>>,
     ascii_mode: crate::language_bar::SharedAsciiMode,
@@ -1341,6 +1424,15 @@ pub struct XimeTextService {
 }
 
 pub const GUID_LANG_BAR_ITEM: GUID = GUID_LBI_INPUTMODE;
+
+/// 面板快捷键（U-16）：保留键 GUID（自定义，仅用于本输入法的「打开面板」）。
+pub const PANEL_HOTKEY_GUID: GUID =
+    GUID::from_u128(0x7d1e_4a2c_9b83_4e61_a5f0_3c72_8d94_e1b6);
+/// 面板快捷键主键：VK_OEM_3（`` ` ``）。TF_PRESERVEDKEY.uModifiers 用
+/// TF_MOD_CONTROL 才表示 Ctrl+`——但 Ctrl+` 在多数应用里没有内置语义、
+/// 单独 ` 也常被方案占用，本期默认注册 **Ctrl+`**（见 activate_impl 里
+/// uModifiers: TF_MOD_CONTROL）。
+pub const PANEL_HOTKEY_VK: u32 = VK_OEM_3 as u32;
 
 /// Shift 移位字符 keysym（美式布局；ASCII 可见字符的 keysym == ASCII 码）。
 /// X11 语义：Shift+可打印键上报移位后的字符（Shift+/ → '?'），librime 的
@@ -1439,7 +1531,7 @@ impl XimeTextService {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         let ipc = IpcClientHandle::empty();
-        debug!(
+        trace!(
             "XimeTextService::new() called, IPC state ptr={:p}",
             ipc.state
         );
@@ -1465,12 +1557,13 @@ impl XimeTextService {
             test_keydown_pending: std::cell::Cell::new(false),
             test_keyup_pending: std::cell::Cell::new(false),
             self_host: std::cell::Cell::new(false),
+            panel_hotkey_advised: std::cell::Cell::new(false),
         }
     }
 
     fn ensure_ipc(&self) -> std::result::Result<(), winxime_ipc::IpcError> {
         let connected = self.ipc.is_connected();
-        debug!(
+        trace!(
             "ensure_ipc: is_connected={}, ptr={:p}",
             connected,
             self.ipc.debug_ptr()
@@ -1478,22 +1571,22 @@ impl XimeTextService {
         if connected {
             return Ok(());
         }
-        debug!("ensure_ipc: attempting connect...");
+        trace!("ensure_ipc: attempting connect...");
         match self.ipc.connect() {
             Ok(()) => {
                 let (_, response) = self.ipc.start_session();
                 if let Some(response) = response {
                     if let Some(status) = response.status {
-                        debug!("ensure_ipc: initial ascii_mode={}", status.ascii_mode);
+                        trace!("ensure_ipc: initial ascii_mode={}", status.ascii_mode);
                         self.ascii_mode
                             .store(status.ascii_mode, std::sync::atomic::Ordering::Release);
                     }
                 }
-                debug!("ensure_ipc: connect OK");
+                trace!("ensure_ipc: connect OK");
                 Ok(())
             }
             Err(e) => {
-                debug!("ensure_ipc: connect FAILED: {:?}", e);
+                trace!("ensure_ipc: connect FAILED: {:?}", e);
                 Err(e)
             }
         }
@@ -1524,32 +1617,46 @@ impl XimeTextService_Impl {
 
         match self.ensure_ipc() {
             Ok(()) => {
-                debug!("IPC connected successfully");
+                trace!("IPC connected successfully");
             }
-            Err(e) => debug!("IPC connection failed: {:?}", e),
+            Err(e) => trace!("IPC connection failed: {:?}", e),
         }
 
         if let Some(thread_mgr) = ptim {
             // Register ITfKeyEventSink directly (self implements ITfKeyEventSink)
             if let Ok(kmgr) = thread_mgr.cast::<ITfKeystrokeMgr>() {
-                debug!("Got ITfKeystrokeMgr, attempting AdviseKeyEventSink...");
+                trace!("Got ITfKeystrokeMgr, attempting AdviseKeyEventSink...");
                 use windows_core::ComObjectInterface;
                 let key_sink_ref = ComObjectInterface::<ITfKeyEventSink>::as_interface_ref(self);
                 let key_sink: ITfKeyEventSink = key_sink_ref.to_owned();
 
                 unsafe {
                     if kmgr.AdviseKeyEventSink(tid, &key_sink, true).is_ok() {
-                        debug!("AdviseKeyEventSink succeeded");
+                        trace!("AdviseKeyEventSink succeeded");
                     } else {
-                        debug!("AdviseKeyEventSink failed");
+                        trace!("AdviseKeyEventSink failed");
+                    }
+                    // 面板快捷键（U-16）：注册保留键 Ctrl+`（VK_OEM_3 +
+                    // TF_MOD_CONTROL），命中时 OnPreservedKey 发 TogglePanel 给
+                    // server。保留键在输入法激活期间由 TSF 分发，不占系统全局热键。
+                    let preserve = TF_PRESERVEDKEY {
+                        uVKey: PANEL_HOTKEY_VK,
+                        uModifiers: TF_MOD_CONTROL,
+                    };
+                    match kmgr.PreserveKey(tid, &PANEL_HOTKEY_GUID, &preserve, &[]) {
+                        Ok(()) => {
+                            self.panel_hotkey_advised.set(true);
+                            trace!("Panel hotkey (Ctrl+`) preserved");
+                        }
+                        Err(e) => trace!("PreserveKey panel hotkey failed: {:?}", e),
                     }
                 }
             } else {
-                debug!("Failed to get ITfKeystrokeMgr");
+                trace!("Failed to get ITfKeystrokeMgr");
             }
 
             if let Ok(lang_bar_mgr) = thread_mgr.cast::<ITfLangBarItemMgr>() {
-                debug!("Got ITfLangBarItemMgr, creating LangBarItem...");
+                trace!("Got ITfLangBarItemMgr, creating LangBarItem...");
                 let lang_bar = crate::language_bar::LangBarItemButton::new(
                     GUID_LANG_BAR_ITEM,
                     self.ipc.clone(),
@@ -1561,21 +1668,21 @@ impl XimeTextService_Impl {
                 let add_result = unsafe { lang_bar_mgr.AddItem(&lang_bar_itf) };
                 match add_result {
                     Ok(_) => {
-                        debug!("LangBarItem added successfully");
+                        trace!("LangBarItem added successfully");
                         *self.lang_bar_mgr.borrow_mut() = Some(lang_bar_mgr);
                         *self.lang_bar_item.borrow_mut() = Some(lang_bar_itf);
                     }
                     Err(e) => {
-                        debug!("LangBarItem AddItem failed: {:?}", e);
+                        trace!("LangBarItem AddItem failed: {:?}", e);
                     }
                 }
             } else {
-                debug!("Failed to get ITfLangBarItemMgr");
+                trace!("Failed to get ITfLangBarItemMgr");
             }
 
             // Register profile activation sink for input method switching
             if let Ok(source) = thread_mgr.cast::<ITfSource>() {
-                debug!("Got ITfSource from thread_mgr, registering sinks...");
+                trace!("Got ITfSource from thread_mgr, registering sinks...");
                 use windows_core::ComObjectInterface;
 
                 // Register ITfActiveLanguageProfileNotifySink
@@ -1589,11 +1696,11 @@ impl XimeTextService_Impl {
                     if let Ok(cookie) =
                         source.AdviseSink(&ITfActiveLanguageProfileNotifySink::IID, &profile_sink)
                     {
-                        debug!("Profile sink registered, cookie={}", cookie);
+                        trace!("Profile sink registered, cookie={}", cookie);
                         self.profile_sink_cookie.set(cookie);
                         *self.profile_source.borrow_mut() = Some(source.clone());
                     } else {
-                        debug!("Failed to AdviseSink for profile");
+                        trace!("Failed to AdviseSink for profile");
                     }
                 }
 
@@ -1606,11 +1713,11 @@ impl XimeTextService_Impl {
                     if let Ok(cookie) =
                         source.AdviseSink(&ITfThreadFocusSink::IID, &thread_focus_sink)
                     {
-                        debug!("Thread focus sink registered, cookie={}", cookie);
+                        trace!("Thread focus sink registered, cookie={}", cookie);
                         self.thread_focus_sink_cookie.set(cookie);
                         *self.thread_focus_source.borrow_mut() = Some(source.clone());
                     } else {
-                        debug!("Failed to AdviseSink for thread focus");
+                        trace!("Failed to AdviseSink for thread focus");
                     }
                 }
 
@@ -1624,24 +1731,24 @@ impl XimeTextService_Impl {
                     if let Ok(cookie) =
                         source.AdviseSink(&ITfThreadMgrEventSink::IID, &thread_mgr_event_sink)
                     {
-                        debug!("ThreadMgrEventSink registered, cookie={}", cookie);
+                        trace!("ThreadMgrEventSink registered, cookie={}", cookie);
                         self.thread_mgr_event_sink_cookie.set(cookie);
                     } else {
-                        debug!("Failed to AdviseSink for ThreadMgrEventSink");
+                        trace!("Failed to AdviseSink for ThreadMgrEventSink");
                     }
                 }
             } else {
-                debug!("Failed to get ITfSource from thread_mgr");
+                trace!("Failed to get ITfSource from thread_mgr");
             }
         } else {
-            debug!("No thread_mgr available");
+            trace!("No thread_mgr available");
         }
 
         Ok(())
     }
 
     fn deactivate_impl(&self) -> Result<()> {
-        debug!("Deactivate called");
+        trace!("Deactivate called");
         self.ipc.hide_tray_icon(self.client_id.get());
 
         // Unregister profile sink
@@ -1685,6 +1792,15 @@ impl XimeTextService_Impl {
 
                 unsafe {
                     let _ = kmgr.UnadviseKeyEventSink(self.client_id.get());
+                    // 面板快捷键的保留键一并注销（只在成功注册过时）。
+                    if self.panel_hotkey_advised.get() {
+                        let preserve = TF_PRESERVEDKEY {
+                            uVKey: PANEL_HOTKEY_VK,
+                            uModifiers: TF_MOD_CONTROL,
+                        };
+                        let _ = kmgr.UnpreserveKey(&PANEL_HOTKEY_GUID, &preserve);
+                        self.panel_hotkey_advised.set(false);
+                    }
                 }
             }
         }
@@ -1694,7 +1810,7 @@ impl XimeTextService_Impl {
 
                 unsafe {
                     if let Err(e) = lang_bar_mgr.RemoveItem(&lang_bar_item) {
-                        debug!("RemoveItem failed: {:?}", e);
+                        trace!("RemoveItem failed: {:?}", e);
                     }
                 }
             }
@@ -1733,46 +1849,46 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
         let clsid_ref = unsafe { clsid.as_ref() };
         let profile_ref = unsafe { guidprofile.as_ref() };
 
-        debug!("ITfActiveLanguageProfileNotifySink::OnActivated: clsid={:?}, profile={:?}, activated={}", clsid_ref, profile_ref, factivated.0);
+        trace!("ITfActiveLanguageProfileNotifySink::OnActivated: clsid={:?}, profile={:?}, activated={}", clsid_ref, profile_ref, factivated.0);
 
         let our_clsid = crate::class_factory::CLSID_XIME;
-        debug!("  -> our_clsid = {:?}", our_clsid);
+        trace!("  -> our_clsid = {:?}", our_clsid);
 
         if let Some(clsid_val) = clsid_ref {
-            debug!("  -> clsid_val = {:?}", clsid_val);
-            debug!("  -> clsid_val == our_clsid? {}", clsid_val == &our_clsid);
+            trace!("  -> clsid_val = {:?}", clsid_val);
+            trace!("  -> clsid_val == our_clsid? {}", clsid_val == &our_clsid);
             if clsid_val != &our_clsid {
-                debug!("  -> Not our TIP, ignoring");
+                trace!("  -> Not our TIP, ignoring");
                 return Ok(());
             }
-            debug!("  -> clsid matches our TIP!");
+            trace!("  -> clsid matches our TIP!");
         } else {
-            debug!("  -> clsid_ref is None");
+            trace!("  -> clsid_ref is None");
         }
 
-        debug!("  -> factivated.as_bool() = {}", factivated.as_bool());
+        trace!("  -> factivated.as_bool() = {}", factivated.as_bool());
 
         if factivated.as_bool() {
-            debug!("  -> Our TIP is being activated!");
+            trace!("  -> Our TIP is being activated!");
 
             // 服务进程自身的实例：不连 IPC（否则 FocusOut 会清掉用户正在打的字）。
             if self.self_host.get() {
-                debug!("  -> self host (server process), skipping IPC");
+                trace!("  -> self host (server process), skipping IPC");
                 return Ok(());
             }
 
             if !self.ipc.is_connected() {
-                debug!("  -> IPC not connected, attempting reconnect...");
+                trace!("  -> IPC not connected, attempting reconnect...");
                 if self.ipc.connect().is_err() {
-                    debug!("  -> Reconnect failed, skipping");
+                    trace!("  -> Reconnect failed, skipping");
                     return Ok(());
                 }
-                debug!("  -> Reconnected!");
+                trace!("  -> Reconnected!");
             }
 
             if let Some(response) = self.ipc.start_session().1 {
                 if let Some(status) = response.status {
-                    debug!("  -> ascii_mode from server: {}", status.ascii_mode);
+                    trace!("  -> ascii_mode from server: {}", status.ascii_mode);
                     self.ascii_mode
                         .store(status.ascii_mode, std::sync::atomic::Ordering::Release);
 
@@ -1790,7 +1906,7 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
             }
             self.ipc.show_tray_icon(self.client_id.get());
         } else {
-            debug!("  -> Our TIP is being deactivated");
+            trace!("  -> Our TIP is being deactivated");
             self.ipc.hide_candidates();
             self.ipc.hide_tray_icon(self.client_id.get());
         }
@@ -1830,7 +1946,7 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
         pdimfocus: Ref<'_, ITfDocumentMgr>,
         pdimprevfocus: Ref<'_, ITfDocumentMgr>,
     ) -> Result<()> {
-        debug!(
+        trace!(
             "ITfThreadMgrEventSink::OnSetFocus (pdimfocus.is_null={}, processing_focus={})",
             pdimfocus.is_null(),
             self.processing_focus.get()
@@ -1838,19 +1954,19 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
 
         // 服务进程自身的实例：焦点事件一律不理（它会 reconnect 回自己、再发 FocusOut）。
         if self.self_host.get() {
-            debug!("  -> self host (server process), ignoring focus event");
+            trace!("  -> self host (server process), ignoring focus event");
             return Ok(());
         }
 
         // Re-entrancy guard: prevent focus event nesting from STA message pumping
         if self.processing_focus.get() {
-            debug!("  -> re-entrant: skipping");
+            trace!("  -> re-entrant: skipping");
             return Ok(());
         }
         self.processing_focus.set(true);
 
         if pdimfocus.is_null() {
-            debug!("  -> Focus lost (pdimfocus is null)");
+            trace!("  -> Focus lost (pdimfocus is null)");
 
             // B2：失焦前把影子缓冲的数字从 server 取回来，在**旧 context** 上提交。
             // 注意顺序：先同步请求（响应里带 commit），再排编辑会话；如果排在
@@ -1871,7 +1987,7 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
                     if !composition_present {
                         // 焦点变化时 TSF 往往先 OnCompositionTerminated：组词串里的
                         // 数字已经作为普通文本留在文档里，再提交就是第二份。
-                        debug!(
+                        trace!(
                             "  -> flush: composition already terminated, skip commit"
                         );
                     } else if let Some(prev) = pdimprevfocus.as_ref() {
@@ -1880,17 +1996,17 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
                             Ok(prev_context) => {
                                 commit_scheduled =
                                     self.schedule_flush_edit_session(&prev_context, output);
-                                debug!(
+                                trace!(
                                     "  -> flush shadow commit scheduled={}",
                                     commit_scheduled
                                 );
                             }
                             Err(e) => {
-                                debug!("  -> flush: prevfocus.GetTop failed: {:?}", e);
+                                trace!("  -> flush: prevfocus.GetTop failed: {:?}", e);
                             }
                         }
                     } else {
-                        debug!("  -> flush: no previous document manager");
+                        trace!("  -> flush: no previous document manager");
                     }
                 }
             }
@@ -1901,23 +2017,23 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
             return Ok(());
         }
 
-        debug!("  -> Focus gained (pdimfocus is valid)");
+        trace!("  -> Focus gained (pdimfocus is valid)");
 
         if !self.ipc.is_connected() {
-            debug!("  -> IPC not connected, attempting reconnect...");
+            trace!("  -> IPC not connected, attempting reconnect...");
             if self.ipc.connect().is_err() {
-                debug!("  -> Reconnect failed");
+                trace!("  -> Reconnect failed");
                 self.processing_focus.set(false);
                 return Ok(());
             }
-            debug!("  -> Reconnected!");
+            trace!("  -> Reconnected!");
             // start_session is already called inside connect() -> ensure_ipc
         }
 
         // Sync ascii_mode from server status
         if let Some(response) = self.ipc.start_session().1 {
             if let Some(status) = response.status {
-                debug!("  -> ascii_mode from server: {}", status.ascii_mode);
+                trace!("  -> ascii_mode from server: {}", status.ascii_mode);
                 self.ascii_mode
                     .store(status.ascii_mode, std::sync::atomic::Ordering::Release);
 

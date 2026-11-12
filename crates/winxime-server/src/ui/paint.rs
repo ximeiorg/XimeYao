@@ -20,7 +20,7 @@ use windows_numerics::Vector2;
 
 use super::layout::calculate_client_rect;
 use super::model::{CandidateModel, RenderedMetrics, RootModel};
-use super::panel::{draw_menu_button, draw_panel, PanelGrid, PanelList, VoiceView};
+use super::panel::{draw_menu_button, draw_panel, PanelGrid, PanelList, PanelSide, VoiceView};
 use super::panel::{MENU_BUTTON_GAP, MENU_BUTTON_SIZE, MENU_STRIP_HEIGHT};
 use super::view::RenderedView;
 use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
@@ -212,6 +212,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
         view: &RenderedView,
         model: &CandidateModel,
         panel: Option<PanelPaintState>,
+        panel_progress: f32,
         list: &PanelList,
         grid: &PanelGrid,
         voice: &VoiceView,
@@ -219,11 +220,11 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
         let dpi = RenderedView::get_dpi_for_window(view.hwnd);
         let metrics =
             calculate_client_rect(&view.dwrite_factory, model, dpi, panel.map(|state| state.page))?;
-        on_paint_with_metrics(view, model, dpi, &metrics, panel, list, grid, voice)
+        on_paint_with_metrics(view, model, dpi, &metrics, panel, panel_progress, list, grid, voice)
     }
 
-    // 8 个参数＝绘制上下文 + 模型/度量 + 三份可选页面状态；收成结构体要连带
-    // 改调用链，属技术债 D（巨函数拆分）范围，这里先放行。
+    // 9 个参数＝绘制上下文 + 模型/度量 + 三份可选页面状态 + 动画进度；收成
+    // 结构体要连带改调用链，属技术债 D（巨函数拆分）范围，这里先放行。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_paint_with_metrics(
         view: &RenderedView,
@@ -231,6 +232,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
         dpi: f32,
         metrics: &RenderedMetrics,
         panel: Option<PanelPaintState>,
+        panel_progress: f32,
         list: &PanelList,
         grid: &PanelGrid,
         voice: &VoiceView,
@@ -346,6 +348,12 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 .map_err(|e| format!("CreateSolidColorBrush comment failed: {:?}", e))?;
 
             let mut col = 0usize;
+            // Above 布局（面板在候选栏上方）时，候选条带被推到窗口底部：
+            // y 偏移 = 窗口内容高 - 候选栏高 = 面板高 + 间距（与 layout.rs 的 menu_button 同源）。
+            let bar_top = match metrics.panel_side {
+                Some(PanelSide::Above) => metrics.height - metrics.bar_height,
+                _ => 0.0,
+            };
             let start_x = MARGIN
                 + if model.horizontal {
                     MENU_BUTTON_SIZE + MENU_BUTTON_GAP
@@ -354,7 +362,8 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 }
                 + blur_radius;
             let mut x = start_x;
-            let mut y = MARGIN
+            let mut y = bar_top
+                + MARGIN
                 + if model.horizontal {
                     0.0
                 } else {
@@ -512,15 +521,18 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 }
             }
 
-            // 面板区：候选栏下方（展开时），与候选区同一窗口、间距分隔。
+            // 面板区：按候选栏方向贴上方（横向）或右侧（纵向），与候选区同一窗口。
             if let Some(state) = panel {
+                // 候选栏自身宽度 = 窗口内容宽 - 面板内容宽（Right 侧面板加在它右边）。
+                let bar_width = metrics.width - metrics.panel_content_width;
                 draw_panel(
                     &view.d2d_context,
                     &view.dwrite_factory,
                     model,
-                    blur_radius,
-                    metrics.width,
-                    metrics.bar_height,
+                    metrics.panel_content_width,
+                    bar_width,
+                    metrics.panel_side.unwrap_or(PanelSide::Right),
+                    panel_progress,
                     state,
                     list,
                     grid,
