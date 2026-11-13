@@ -35,6 +35,13 @@ pub(crate) struct RenderedMetrics {
     pub(crate) text_widths: Vec<f32>,
     /// "⋮"/"⋯" 菜单按钮矩形（窗口 DIP 坐标）。
     pub(crate) menu_button: Option<(f32, f32, f32, f32)>,
+    /// 面板展开方向（`None` = 面板收起，见 `panel::panel_side`）。
+    pub(crate) panel_side: Option<super::panel::PanelSide>,
+    /// 面板内容宽度（DIP）；面板收起时无意义。
+    ///
+    /// 面板贴右侧时窗口宽 = 候选栏宽 + 间距 + 面板宽，命中测试与绘制都要用
+    /// 「候选栏自身宽度」区分两者，此字段即候选栏宽之外的面板部分。
+    pub(crate) panel_content_width: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,11 +171,6 @@ impl From<&Context> for CandidateModel {
         // rime 的固定 1–9 + 0（librime 的 selector 原生按
         // `index = ((ch - XK_0) + 9) % 10` 映射，所以 0 就是第 10 个）。
         let selkeys = selkeys_from_labels(&ctx.candidates.labels);
-
-        // 候选栏一次显示几个：`style.candidate_count`（文档语义）。
-        // rime 一页最多给 `menu/page_size` 个，所以这里再截断一次——
-        // page_size 由服务端在部署时对齐（见 server 的 `set_page_size`）。
-        let max_items = config.style.candidate_count.clamp(1, 32) as usize;
 
         Self {
             items: ctx

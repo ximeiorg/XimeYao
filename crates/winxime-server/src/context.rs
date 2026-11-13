@@ -47,7 +47,16 @@ pub struct InputContext {
     pub commit_text: String,
     pub caret_x: i32,
     pub caret_y: i32,
+    /// 插入点所在行的高度（物理像素）。TSF 未上报时为 0，由候选栏布局回落默认行高。
+    pub caret_height: i32,
     pub suggestion_state: Option<SuggestionState>,
+}
+
+impl InputContext {
+    /// 候选栏定位锚点：`(插入点左边, 插入行下沿, 插入行高度)`，全部物理像素。
+    pub fn caret_anchor(&self) -> (i32, i32, i32) {
+        (self.caret_x, self.caret_y, self.caret_height)
+    }
 }
 
 /// 跨线程共享的输入上下文（IPC 线程写、面板线程读）。

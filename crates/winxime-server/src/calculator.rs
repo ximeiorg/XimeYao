@@ -20,7 +20,7 @@
 //! - 进出都写 info 日志；逐键只 trace。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use winxime_ipc::{CandidateInfo, Context, IpcResponse, Text};
@@ -67,11 +67,7 @@ static BUFFER: Mutex<Option<String>> = Mutex::new(None);
 /// 宿主 TSF 每次按键上报的是**组词串末端**的光标；跟着它走，候选栏会随着算式
 /// 变长每按一键向右滑一格——就是实机上看到的「抖动」。计算器会话内位置固定，
 /// 锚在进入点，只让宽度随结果变化。
-static ANCHOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
-
-/// 候选栏是否已显示。只在计算器会话内使用：已显示时只 `update` 内容，
-/// 不再每键 `show`（重复 `ShowWindow`/`SetWindowPos` 会造成可见的闪动）。
-static WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
+static ANCHOR: Mutex<Option<(i32, i32, i32)>> = Mutex::new(None);
 
 /// 与当前候选一一对应的上屏文本：`Some(text)` = 点击该候选就提交 text；
 /// `None` = 只展示（错误提示），点了不上屏。由 [`compose_response`] 同步更新，
@@ -83,8 +79,8 @@ static COMMITTABLE: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
 static SELECTED: Mutex<usize> = Mutex::new(0);
 
 /// B2 数字开头的影子缓冲。`Some("12")` = 已吞下数字、等待运算符。
-/// 默认开启；`calculator.auto_detect: false` 可关，开发期也可用
-/// `%APPDATA%\xime\auto_detect.flag` / 环境变量强制打开。
+/// 默认开启；`calculator.auto_detect: false` 可关（设置页「外观 → 数学计算」
+/// 就是这个开关），开发期也可用环境变量 `XIME_CALC_AUTODETECT` 强制打开。
 static SHADOW: Mutex<Option<String>> = Mutex::new(None);
 
 /// 影子缓冲的「代」：每次内容/状态变化 +1，旧的空闲提交线程据此放弃。
@@ -94,7 +90,16 @@ static SHADOW_GEN: AtomicU64 = AtomicU64::new(0);
 /// 也不切窗口」的场景；正常退出靠非算式键回放 / 失焦提交。
 const SHADOW_IDLE_COMMIT_MS: u64 = 2500;
 
-static AUTO_DETECT: OnceLock<bool> = OnceLock::new();
+/// 自动识别开关缓存：`(读取时的用户配置 mtime, 开关值)`。
+/// `None` = 还没读过。设置页保存后用户文件 mtime 必变，据此自动重读，
+/// 开关不用重启 server 就能生效（与 `config::get()` 的缓存策略一致）。
+static AUTO_DETECT: Mutex<Option<(Option<std::time::SystemTime>, bool)>> = Mutex::new(None);
+
+fn auto_detect_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(xime_config::XimeConfig::config_path())
+        .and_then(|meta| meta.modified())
+        .ok()
+}
 
 fn lock_shadow() -> MutexGuard<'static, Option<String>> {
     match SHADOW.lock() {
@@ -148,7 +153,7 @@ fn move_selection(next: bool) -> bool {
     true
 }
 
-fn lock_anchor() -> MutexGuard<'static, Option<(i32, i32)>> {
+fn lock_anchor() -> MutexGuard<'static, Option<(i32, i32, i32)>> {
     match ANCHOR.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -179,12 +184,11 @@ pub fn reset(reason: &str) {
     let _ = lock_shadow().take();
     cancel_shadow_idle_commit();
     *lock_anchor() = None;
-    WINDOW_SHOWN.store(false, Ordering::Relaxed);
     lock_committable().clear();
     *lock_selected() = 0;
     let mut buffer = lock_buffer();
     if buffer.take().is_some() {
-        tracing::info!("计算器：退出（{reason}）");
+        tracing::debug!("计算器：退出（{reason}）");
     }
 }
 
@@ -193,22 +197,29 @@ pub fn candidate_commit_text(index: usize) -> Option<String> {
     lock_committable().get(index).cloned().flatten()
 }
 
-/// B2 原型开关：环境变量或 `%APPDATA%\xime\auto_detect.flag` 存在即启用。
-/// 只读一次（重启 server 生效）——热路径上不做文件 IO。
+/// 自动识别开关（数字开头是否进影子缓冲）。
+///
+/// 读取顺序：环境变量 `XIME_CALC_AUTODETECT` 非空 → 强制开；
+/// 否则读 `xime.custom.yaml` 的 `calculator.auto_detect`（默认开启，显式
+/// `false` 才关）。值按用户配置文件的 mtime 缓存：设置页保存后 mtime 变，
+/// 下一次按键就会读到新开关，不用重启 server。
 pub fn auto_detect_enabled() -> bool {
-    *AUTO_DETECT.get_or_init(|| {
-        if std::env::var_os("XIME_CALC_AUTODETECT").is_some() {
-            return true;
+    if std::env::var_os("XIME_CALC_AUTODETECT").is_some() {
+        return true;
+    }
+    let stamp = auto_detect_stamp();
+    let mut cached = match AUTO_DETECT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match cached.as_ref() {
+        Some((cached_stamp, enabled)) if *cached_stamp == stamp => *enabled,
+        _ => {
+            let enabled = auto_detect_from_config();
+            *cached = Some((stamp, enabled));
+            enabled
         }
-        if std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|p| p.join("xime").join("auto_detect.flag").exists())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        auto_detect_from_config()
-    })
+    }
 }
 
 /// 正式开关：`xime.custom.yaml` 的 `calculator.auto_detect`，**默认开启**；
@@ -261,7 +272,7 @@ pub fn trigger_blocked(eng: &RimeEngine) -> bool {
         }
     }
     let blocked = compute_trigger_blocked(&schema_id);
-    tracing::info!(
+    tracing::debug!(
         "计算器：触发键 `{}` 检测，方案 {} —— {}",
         TRIGGER,
         schema_id,
@@ -423,7 +434,7 @@ pub fn handle_active_key(
                 // 缓冲只剩前导 `=`：组词串是计算器自己画的，从未落进文档——
                 // 必须自己收掉再回包，不能把退格交给应用去删真正的文本。
                 let _ = buffer.take();
-                tracing::info!("计算器：退出（退格删空前缀）");
+                tracing::debug!("计算器：退出（退格删空前缀）");
                 return ActiveKeyOutcome::Handled(Box::new(close_response(
                     session_id, eng, context, window,
                 )));
@@ -440,7 +451,7 @@ pub fn handle_active_key(
             } else {
                 // 没有第二条可选项：方向键照旧退出，把光标移动还给用户。
                 let _ = buffer.take();
-                tracing::info!("计算器：退出（方向键没有可切换的候选）");
+                tracing::debug!("计算器：退出（方向键没有可切换的候选）");
                 ActiveKeyOutcome::Delegated
             }
         }
@@ -451,13 +462,13 @@ pub fn handle_active_key(
                 )))
             } else {
                 let _ = buffer.take();
-                tracing::info!("计算器：退出（方向键没有可切换的候选）");
+                tracing::debug!("计算器：退出（方向键没有可切换的候选）");
                 ActiveKeyOutcome::Delegated
             }
         }
         CalcAction::Clear => {
             let _ = buffer.take();
-            tracing::info!("计算器：退出（Esc）");
+            tracing::debug!("计算器：退出（Esc）");
             ActiveKeyOutcome::Handled(Box::new(close_response(
                 session_id, eng, context, window,
             )))
@@ -475,7 +486,7 @@ pub fn handle_active_key(
             match selected_text {
                 Some(text) => {
                     let _ = buffer.take();
-                    tracing::info!("计算器：上屏（选中）{text}");
+                    tracing::debug!("计算器：上屏（选中）{text}");
                     context.update(|c| {
                         c.suggestion_state = None;
                         c.commit_text = text.clone();
@@ -483,7 +494,6 @@ pub fn handle_active_key(
                         c.composition.preedit.clear();
                     });
                     *lock_anchor() = None;
-                    WINDOW_SHOWN.store(false, Ordering::Relaxed);
                     lock_committable().clear();
                     *lock_selected() = 0;
                     window.hide();
@@ -502,7 +512,7 @@ pub fn handle_active_key(
                         // 只有前导 `=`：上屏键没有可提交的内容，收掉组词串退出
                         //（不把键交给应用——那会在旧组词串还开着时插一个空格）。
                         let _ = buffer.take();
-                        tracing::info!("计算器：退出（空算式按上屏键）");
+                        tracing::debug!("计算器：退出（空算式按上屏键）");
                         return ActiveKeyOutcome::Handled(Box::new(close_response(
                             session_id, eng, context, window,
                         )));
@@ -519,7 +529,7 @@ pub fn handle_active_key(
         }
         CalcAction::Delegate => {
             let _ = buffer.take();
-            tracing::info!("计算器：退出（按键不归计算器，交给正常流程）");
+            tracing::debug!("计算器：退出（按键不归计算器，交给正常流程）");
             ActiveKeyOutcome::Delegated
         }
     }
@@ -544,10 +554,10 @@ pub fn try_enter(
         }
         *buffer = Some(String::new());
     }
-    tracing::info!("计算器：进入（`=` 前缀，Esc 退出；空格/回车/`=` 上屏结果）");
+    tracing::debug!("计算器：进入（`=` 前缀，Esc 退出；空格/回车/`=` 上屏结果）");
     let (anchor_x, anchor_y) = context.read(|c| (c.caret_x, c.caret_y));
-    *lock_anchor() = Some((anchor_x, anchor_y));
-    WINDOW_SHOWN.store(false, Ordering::Relaxed);
+    let anchor_height = context.read(|c| c.caret_height);
+    *lock_anchor() = Some((anchor_x, anchor_y, anchor_height));
     *lock_selected() = 0;
     context.update(|c| {
         c.suggestion_state = None;
@@ -569,7 +579,7 @@ pub fn try_enter(
 }
 
 /// 候选栏左上角：会话锚点优先；没有锚点（测试/异常路径）才用当前光标。
-fn window_origin(anchor: Option<(i32, i32)>, caret: (i32, i32)) -> (i32, i32) {
+fn window_origin(anchor: Option<(i32, i32, i32)>, caret: (i32, i32, i32)) -> (i32, i32, i32) {
     anchor.unwrap_or(caret)
 }
 
@@ -632,7 +642,7 @@ fn schedule_shadow_idle_commit() {
             return;
         };
         let count = digits.chars().count();
-        tracing::info!("自动识别：空闲 {SHADOW_IDLE_COMMIT_MS}ms 提交 {count} 字");
+        tracing::debug!("自动识别：空闲 {SHADOW_IDLE_COMMIT_MS}ms 提交 {count} 字");
         if !crate::paste::request_commit(&digits) {
             let _ = crate::paste::take_pending();
             // 注入失败：把数字放回影子缓冲，等下一次按键/失焦再处理。
@@ -654,10 +664,9 @@ pub fn take_shadow_for_flush() -> Option<String> {
     let digits = lock_shadow().take()?;
     cancel_shadow_idle_commit();
     *lock_anchor() = None;
-    WINDOW_SHOWN.store(false, Ordering::Relaxed);
     *lock_selected() = 0;
     let count = digits.chars().count();
-    tracing::info!("自动识别：失焦提交 {count} 字");
+    tracing::debug!("自动识别：失焦提交 {count} 字");
     Some(digits)
 }
 
@@ -697,10 +706,10 @@ pub fn try_enter_shadow(
         *shadow = Some(first.to_string());
     }
     let (x, y) = context.read(|c| (c.caret_x, c.caret_y));
-    *lock_anchor() = Some((x, y));
-    WINDOW_SHOWN.store(false, Ordering::Relaxed);
+    let anchor_height = context.read(|c| c.caret_height);
+    *lock_anchor() = Some((x, y, anchor_height));
     *lock_selected() = 0;
-    tracing::info!("自动识别：进入影子缓冲（数字开头）");
+    tracing::debug!("自动识别：进入影子缓冲（数字开头）");
     let value = lock_shadow().clone().unwrap_or_default();
     schedule_shadow_idle_commit();
     Some(shadow_response(&value, session_id, eng, context, window))
@@ -744,7 +753,7 @@ pub fn handle_shadow_key(
             let digits = shadow.take().unwrap_or_default();
             drop(shadow);
             let expr = format!("{digits}{ch}");
-            tracing::info!("自动识别：识别为算式 `{expr}`");
+            tracing::debug!("自动识别：识别为算式 `{expr}`");
             handoff_to_calculator(expr, session_id, eng, context, window)
         }
         ShadowAction::Finish => {
@@ -755,7 +764,7 @@ pub fn handle_shadow_key(
                     session_id, eng, context, window,
                 )));
             }
-            tracing::info!("自动识别：`=` 结束，按算式 `{digits}` 接管");
+            tracing::debug!("自动识别：`=` 结束，按算式 `{digits}` 接管");
             handoff_to_calculator(digits, session_id, eng, context, window)
         }
         ShadowAction::Backspace => {
@@ -785,7 +794,7 @@ pub fn handle_shadow_key(
             let digits = shadow.take().unwrap_or_default();
             drop(shadow);
             cancel_shadow_idle_commit();
-            tracing::info!("自动识别：回车提交 {} 字", digits.chars().count());
+            tracing::debug!("自动识别：回车提交 {} 字", digits.chars().count());
             let mut response = close_response(session_id, eng, context, window);
             if let Some(ctx) = response.context.as_mut() {
                 ctx.commit = if digits.is_empty() {
@@ -801,7 +810,6 @@ pub fn handle_shadow_key(
             drop(shadow);
             cancel_shadow_idle_commit();
             *lock_anchor() = None;
-            WINDOW_SHOWN.store(false, Ordering::Relaxed);
             *lock_selected() = 0;
             context.update(|c| {
                 c.suggestion_state = None;
@@ -881,12 +889,11 @@ fn shadow_replay(
     window: &std::sync::Arc<CandidateWindow>,
 ) -> ActiveKeyOutcome {
     cancel_shadow_idle_commit();
-    tracing::info!(
+    tracing::debug!(
         "自动识别：回放 {} 字 + 当前键 keysym=0x{keysym:X} mod={modifiers}",
         digits.chars().count()
     );
     *lock_anchor() = None;
-    WINDOW_SHOWN.store(false, Ordering::Relaxed);
     *lock_selected() = 0;
     window.hide();
 
@@ -963,19 +970,19 @@ fn compose_response(
         // 算式没输完：只画组词串，不弹候选栏（候选栏里出现的永远是
         // 能上屏的结果或明确的错误）。
         window.hide();
-        WINDOW_SHOWN.store(false, Ordering::Relaxed);
     } else {
-        // 位置锚在进入点（见 ANCHOR）；已显示时只刷新内容，不再重复 show。
+        // 位置锚在进入点（见 ANCHOR）。锚点与内容一起交给候选栏：一条消息里
+        // 算完尺寸再择位，不会「先按旧尺寸摆一次、再按新尺寸摆一次」。
         let anchor = *lock_anchor();
-        let (x, y) = window_origin(anchor, context.read(|c| (c.caret_x, c.caret_y)));
-        if !WINDOW_SHOWN.swap(true, Ordering::Relaxed) {
-            window.show(x, y);
-        }
-        window.update(&Context {
-            preedit: Text { str: preedit.clone() },
-            commit: None,
-            candidates: candidates.clone(),
-        });
+        let (x, y, h) = window_origin(anchor, context.read(|c| c.caret_anchor()));
+        window.show(
+            (x, y, h),
+            &Context {
+                preedit: Text { str: preedit.clone() },
+                commit: None,
+                candidates: candidates.clone(),
+            },
+        );
     }
 
     IpcResponse {
@@ -1004,7 +1011,6 @@ fn close_response(
         c.composition.preedit.clear();
     });
     *lock_anchor() = None;
-    WINDOW_SHOWN.store(false, Ordering::Relaxed);
     lock_committable().clear();
     *lock_selected() = 0;
     window.hide();
@@ -1618,8 +1624,8 @@ punctuator:
     /// 会话内有锚点就必须用锚点：宿主每次按键报的是组词串末端，跟着它会滑动。
     #[test]
     fn window_origin_prefers_session_anchor() {
-        assert_eq!(window_origin(Some((10, 20)), (99, 99)), (10, 20));
-        assert_eq!(window_origin(None, (99, 99)), (99, 99));
+        assert_eq!(window_origin(Some((10, 20, 30)), (99, 99, 99)), (10, 20, 30));
+        assert_eq!(window_origin(None, (99, 99, 99)), (99, 99, 99));
     }
 
     /// 结果 + 原式两条候选：默认高亮结果，两条都可上屏。

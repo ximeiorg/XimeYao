@@ -1,6 +1,6 @@
 //! 候选栏窗口：窗口/交换链/合成设备创建与全部消息处理（含菜单面板鼠标交互）。
 
-use tracing::{debug, trace};
+use tracing::trace;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -36,29 +36,30 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetMessagePos, GetWindowLongPtrW, HTCLIENT, KillTimer, LoadCursorW,
-    RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW,
-    IDC_HAND, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA,
-    WINDOWPOS, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_SETCURSOR,
+    DefWindowProcW, GetMessagePos, GetWindowLongPtrW, GetWindowRect, HTCLIENT, IsWindowVisible,
+    KillTimer, LoadCursorW, RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST,
+    IDC_ARROW, IDC_HAND, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SW_HIDE, SW_SHOWNA, WINDOWPOS,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_SETCURSOR,
     WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-};
-use windows_core::{HSTRING, Interface, PCWSTR};
+};use windows_core::{HSTRING, Interface, PCWSTR};
 
-use super::layout::{calculate_client_rect, calculate_root_rect, candidate_item_at};
+use super::layout::{
+    calculate_client_rect, calculate_root_rect, candidate_item_at, place_window_sticky,
+    WorkArea,
+};
 use super::model::{CandidateModel, RootModel};
 use super::paint::{on_paint, on_paint_root, on_paint_with_metrics};
 use super::panel::{
     dispatch_action, menu_item_id, menu_item_label, panel_height, panel_hit, rect_contains,
-    window_to_panel, MenuAction, PanelHit, PanelPage,
+    window_to_panel, MenuAction, PanelHit, PanelPage, PanelSide,
 };
 use super::{
-    CandidateWindow, BLUR_RADIUS, WM_HIDE_CANDIDATE, WM_HIDE_ROOT, WM_SET_POSITION,
-    WM_SHOW_CANDIDATE, WM_SHOW_ROOT, WM_UPDATE_CANDIDATE,
+    CandidateWindow, PanelAnim, ShowRequest, BLUR_RADIUS, WM_HIDE_CANDIDATE, WM_HIDE_ROOT,
+    WM_SHOW_CANDIDATE, WM_SHOW_ROOT, WM_TOGGLE_PANEL,
 };
 use crate::speech::{self, SpeechState};
-use winxime_ipc::Context;
 
 /// 鼠标离开窗口（windows crate 中该常量位于未启用的 Win32_UI_Controls feature，按 Win32 定义本地声明）。
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -72,6 +73,13 @@ const VOICE_TIMER_ID: usize = 1;
 /// 代价只有一拍读一次状态快照的锁；静默时快照没变化就 `refresh_voice` 返回
 /// false、不重绘，所以提频不会变成"每拍都重画"。
 const VOICE_TIMER_MS: u32 = 60;
+
+/// 面板展开/收起动画定时器（与语音轮询定时器互斥使用不同 id）。
+const PANEL_ANIM_TIMER_ID: usize = 2;
+/// 动画帧间隔：16ms ≈ 60fps。
+const PANEL_ANIM_FRAME_MS: u32 = 16;
+/// 动画总帧数：8 帧 × 16ms ≈ 130ms，够「优雅」又不拖沓。
+const PANEL_ANIM_FRAMES: u32 = 8;
 
 const WINDOW_CLASS: &str = "WinximeCandidateWindow";
 
@@ -260,13 +268,78 @@ impl RenderedView {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
             WM_SHOW_CANDIDATE => {
-                debug!("WM_SHOW_CANDIDATE received, hwnd={:?}", hwnd.0);
-                let result = ShowWindow(hwnd, SW_SHOWNA);
-                debug!("ShowWindow(SW_SHOWNA) result: {:?}", result);
+                // 每键一次：入口信息并入下方布局 trace（U-10）。
+                // 锚点与内容随同一条消息传入（由 IPC 线程 `show` 装箱投递）：
+                // 先建模型、算新尺寸，再择位、绘制，最后才显示窗口。一次摆到位，
+                // 不再「先按旧尺寸摆、再按新尺寸摆」——那两次之间的位移就是用户
+                // 看到的候选栏闪烁（候选数 3 → 10 时高度差好几百 DIP）。
+                let req_ptr = wparam.0 as *mut ShowRequest;
+                let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
+                if !req_ptr.is_null() && !this_ptr.is_null() {
+                    // SAFETY: 发送方用 Box::into_raw 转移 ShowRequest 所有权，消息即移交。
+                    let req = unsafe { *Box::from_raw(req_ptr) };
+                    let this = unsafe { &*this_ptr };
+                    let model = CandidateModel::from(&req.context);
+                    this.model.replace(model.clone());
+                    this.anchor.set(Some(req.anchor));
+
+                    // 输入新内容时收起面板（与 macOS 版候选刷新行为一致）。
+                    // 语音页同理：用户开始打字 = 不要这次听写，丢弃并关定时器。
+                    if this.panel_page.get() == PanelPage::VoiceInput {
+                        Self::leave_voice_page(this, hwnd, true);
+                    }
+                    Self::cancel_panel_anim(this, hwnd);
+                    this.collapse_panel();
+
+                    let view = this.view.borrow();
+                    if let Some(view) = view.as_ref() {
+                        let dpi = RenderedView::get_dpi_for_window(hwnd);
+                        if let Ok(metrics) =
+                            calculate_client_rect(&view.dwrite_factory, &model, dpi, None)
+                        {
+                            this.metrics.replace(Some(metrics.clone()));
+                            trace!(
+                                "WM_SHOW_CANDIDATE: dpi={}, dip={}x{}, hw={}x{}",
+                                dpi,
+                                metrics.width,
+                                metrics.height,
+                                metrics.hw_width,
+                                metrics.hw_height
+                            );
+                            // 插入点变了：必须重新择位（粘滞只对「插入点没动」生效）。
+                            // SAFETY: 同一 UI 线程，this 与 hwnd 均有效。
+                            unsafe {
+                                Self::set_size_and_place(
+                                    this,
+                                    hwnd,
+                                    metrics.hw_width as i32,
+                                    metrics.hw_height as i32,
+                                    true,
+                                )
+                            };
+                            if !model.items.is_empty() {
+                                // 面板已在本次更新开始时收起，按纯候选栏布局绘制。
+                                let _ = on_paint_with_metrics(
+                                    view,
+                                    &model,
+                                    dpi,
+                                    &metrics,
+                                    None,
+                                    1.0,
+                                    &this.panel_list.borrow(),
+                                    &this.panel_grid.borrow(),
+                                    &this.voice.borrow(),
+                                );
+                            }
+                        }
+                    }
+                }
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
                 LRESULT(0)
             }
             WM_HIDE_CANDIDATE => {
-                debug!("WM_HIDE_CANDIDATE received");
+                // 每键可能多次（每次提交/失焦）：低价值，降 trace（U-10）。
+                trace!("WM_HIDE_CANDIDATE received");
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
                     let this = &*this_ptr;
@@ -275,96 +348,39 @@ impl RenderedView {
                     if this.panel_page.get() == PanelPage::VoiceInput {
                         Self::leave_voice_page(this, hwnd, true);
                     }
+                    Self::cancel_panel_anim(this, hwnd);
                     this.collapse_panel();
                     this.metrics.replace(None);
+                    // 下次显示是一次全新的会话：清掉上一次的择位结果，
+                    // 否则窗口会先粘在旧位置。
+                    this.placement.set(None);
+                    this.anchor.set(None);
                 }
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
             }
-            WM_UPDATE_CANDIDATE => {
-                debug!("WM_UPDATE_CANDIDATE received");
-                let ctx_ptr = wparam.0 as *mut Context;
-                if !ctx_ptr.is_null() {
-                    let ctx = Box::from_raw(ctx_ptr);
-                    debug!("ctx.candidates: {} items", ctx.candidates.candies.len());
-                    let model = CandidateModel::from(&*ctx);
-                    trace!("model.items: {:?}", model.items);
-
-                    let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
-                    if !this_ptr.is_null() {
-                        (*this_ptr).model.replace(model.clone());
-                        // 输入新内容时收起面板（与 macOS 版候选刷新行为一致）。
-                        // 语音页同理：用户开始打字 = 不要这次听写，丢弃并关定时器。
-                        if (*this_ptr).panel_page.get() == PanelPage::VoiceInput {
-                            Self::leave_voice_page(&*this_ptr, hwnd, true);
-                        }
-                        (*this_ptr).collapse_panel();
-
-                        let view = (*this_ptr).view.borrow();
-                        if let Some(view) = view.as_ref() {
-                            let dpi = RenderedView::get_dpi_for_window(hwnd);
-                            if let Ok(metrics) = calculate_client_rect(&view.dwrite_factory, &model, dpi, None) {
-                                (*this_ptr).metrics.replace(Some(metrics.clone()));
-                                trace!(
-                                    "候选栏布局: dpi={}, dip={}x{}, hw={}x{}, item_widths={:?}",
-                                    dpi,
-                                    metrics.width,
-                                    metrics.height,
-                                    metrics.hw_width,
-                                    metrics.hw_height,
-                                    metrics.item_widths
-                                );
-                                let _ = SetWindowPos(
-                                    hwnd,
-                                    Some(HWND_TOPMOST),
-                                    0,
-                                    0,
-                                    metrics.hw_width as i32,
-                                    metrics.hw_height as i32,
-                                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
-                                );
-                                if !model.items.is_empty() {
-                                    // 面板已在本次更新开始时收起，按纯候选栏布局绘制。
-                                    let _ = on_paint_with_metrics(
-                                        view,
-                                        &model,
-                                        dpi,
-                                        &metrics,
-                                        None,
-                                        &(*this_ptr).panel_list.borrow(),
-                                        &(*this_ptr).panel_grid.borrow(),
-                                        &(*this_ptr).voice.borrow(),
-                                    );
-                                }
-                            }
-                        }
+            WM_TOGGLE_PANEL => {
+                trace!("WM_TOGGLE_PANEL received");
+                let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
+                if !this_ptr.is_null() {
+                    let this = &*this_ptr;
+                    // 面板快捷键（默认 Ctrl+`）：只有候选栏可见时才响应，
+                    // 避免在没打字的窗口里凭空弹出一个悬空面板。
+                    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+                    if visible {
+                        Self::toggle_panel(this, hwnd);
                     }
-                    trace!("候选栏更新完成");
                 }
                 LRESULT(0)
             }
-            WM_SET_POSITION => {
-                let x = wparam.0 as i32;
-                let y = lparam.0 as i32;
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    x,
-                    y + 24,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-                LRESULT(0)
-            }
             WM_SHOW_ROOT => {
-                debug!("WM_SHOW_ROOT received");
+                trace!("WM_SHOW_ROOT received");
                 let root_ptr = wparam.0 as *mut RootModel;
                 if !root_ptr.is_null() {
                     // SAFETY: 发送方用 Box::into_raw 转移 RootModel 的所有权，消息即移交，
                     // 这里收回后立即 clone，不把指针留到下一轮消息。
                     let root = unsafe { Box::from_raw(root_ptr) };
-                    debug!("showing root for '{}': {}", root.letter, root.root);
+                    trace!("showing root for '{}': {}", root.letter, root.root);
 
                     let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                     if !this_ptr.is_null() {
@@ -376,14 +392,14 @@ impl RenderedView {
                         if let Some(view) = view.as_ref() {
                             let dpi = RenderedView::get_dpi_for_window(hwnd);
                             if let Ok(metrics) = calculate_root_rect(&view.dwrite_factory, &root, dpi) {
-                                let _ = SetWindowPos(
+                                // 字根窗比候选栏矮胖，原位改尺寸会露出上一屏的残影区，
+                                // 所以同样重新择位（锚点不变，只是窗口变小）。
+                                Self::set_size_and_place(
+                                    &*this_ptr,
                                     hwnd,
-                                    Some(HWND_TOPMOST),
-                                    0,
-                                    0,
                                     metrics.hw_width as i32,
                                     metrics.hw_height as i32,
-                                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                                    false,
                                 );
                                 let _ = on_paint_root(view, &root, dpi, &metrics);
                             }
@@ -394,7 +410,7 @@ impl RenderedView {
                 LRESULT(0)
             }
             WM_HIDE_ROOT => {
-                debug!("WM_HIDE_ROOT received");
+                trace!("WM_HIDE_ROOT received");
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
                     (*this_ptr).root_model.replace(None);
@@ -406,14 +422,12 @@ impl RenderedView {
                         if let Ok(metrics) =
                             calculate_client_rect(&view.dwrite_factory, &model, dpi, (*this_ptr).panel_layout_page())
                         {
-                            let _ = SetWindowPos(
+                            Self::set_size_and_place(
+                                &*this_ptr,
                                 hwnd,
-                                Some(HWND_TOPMOST),
-                                0,
-                                0,
                                 metrics.hw_width as i32,
                                 metrics.hw_height as i32,
-                                SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                                false,
                             );
                             if !model.items.is_empty() {
                                 let list = (*this_ptr).panel_list.borrow();
@@ -425,6 +439,7 @@ impl RenderedView {
                                     dpi,
                                     &metrics,
                                     (*this_ptr).panel_paint_state(),
+                                    (*this_ptr).panel_progress(),
                                     &list,
                                     &grid,
                                     &voice,
@@ -454,6 +469,7 @@ impl RenderedView {
                                 view,
                                 &model,
                                 (*this_ptr).panel_paint_state(),
+                                (*this_ptr).panel_progress(),
                                 &list,
                                 &grid,
                                 &voice,
@@ -525,10 +541,16 @@ impl RenderedView {
                     }
 
                     // 面板区域点击：菜单卡片导航 / 返回菜单 / 触发动作 / 剪切板条目复制。
-                    let (panel_width, bar_height, panel_height) = panel_metrics(this);
-                    if let Some((lx, ly)) =
-                        window_to_panel(BLUR_RADIUS, bar_height, panel_width, panel_height, pt_x, pt_y)
-                    {
+                    let (bar_width, _bar_height, panel_width, panel_height, panel_side) =
+                        panel_metrics(this);
+                    if let Some((lx, ly)) = window_to_panel(
+                        bar_width,
+                        panel_width,
+                        panel_height,
+                        panel_side,
+                        pt_x,
+                        pt_y,
+                    ) {
                         let page = this.panel_page.get();
                         let hit = {
                             let list = this.panel_list.borrow();
@@ -541,6 +563,7 @@ impl RenderedView {
                                 if clicked_id == Some("settings") {
                                     // 设置项：回调启动设置程序，并收起面板。
                                     dispatch_action(MenuAction::OpenSettings);
+                                    Self::cancel_panel_anim(this, hwnd);
                                     this.collapse_panel();
                                     Self::relayout_and_repaint(this, hwnd);
                                 } else if let Some(next) = clicked_id.and_then(PanelPage::from_id)
@@ -565,6 +588,7 @@ impl RenderedView {
                                     // 「开子页」或「设置」上，这里是给以后新增卡片的兜底——
                                     // 给一句明确反馈并收起面板，不做「点了没反应」的死卡片。
                                     crate::notify::notify(format!("「{label}」功能暂未开放"));
+                                    Self::cancel_panel_anim(this, hwnd);
                                     this.collapse_panel();
                                     Self::relayout_and_repaint(this, hwnd);
                                 }
@@ -584,8 +608,7 @@ impl RenderedView {
                                 if this.voice.borrow().button_enabled() {
                                     Self::toggle_voice(this, hwnd);
                                 } else {
-                                    tracing::debug!("语音页点击被忽略：当前状态不可开始/结束");
-                                }
+                                    tracing::debug!("语音页点击被忽略：当前状态不可开始/结束");                                }
                             }
                             Some(PanelHit::ListItem(row)) => {
                                 let item = this.panel_list.borrow().item_at(row).cloned();
@@ -605,17 +628,21 @@ impl RenderedView {
                                     if !committed && !copied {
                                         copied = crate::clipboard::write_text(&text);
                                     }
+                                    Self::cancel_panel_anim(this, hwnd);
                                     this.collapse_panel();
                                     Self::relayout_and_repaint(this, hwnd);
-                                    let chars = text.chars().count();
-                                    let body = if committed {
-                                        format!("已上屏（{} 字）", chars)
-                                    } else if copied {
-                                        "已复制到剪贴板，按 Ctrl+V 粘贴".to_string()
-                                    } else {
-                                        "上屏失败：剪贴板被其他程序占用，请重试".to_string()
-                                    };
-                                    crate::notify::notify(body);
+                                    // 上屏成功不再弹通知（U-28）：条目已在光标处，
+                                    // 「已上屏（N 字）」的系统通知是多余打扰。只保留
+                                    // 复制兜底 / 失败重试这两条用户需要行动的提示。
+                                    if !committed && copied {
+                                        crate::notify::notify(
+                                            "已复制到剪贴板，按 Ctrl+V 粘贴",
+                                        );
+                                    } else if !committed && !copied {
+                                        crate::notify::notify(
+                                            "上屏失败：剪贴板被其他程序占用，请重试",
+                                        );
+                                    }
                                 }
                             }
                             Some(PanelHit::PrevPage) => {
@@ -670,16 +697,21 @@ impl RenderedView {
                                     let committed = crate::paste::request_commit(&glyph);
                                     let copied =
                                         !committed && crate::clipboard::write_text(&glyph);
+                                    Self::cancel_panel_anim(this, hwnd);
                                     this.collapse_panel();
                                     Self::relayout_and_repaint(this, hwnd);
-                                    let body = if committed {
-                                        format!("已上屏：{glyph}")
-                                    } else if copied {
-                                        "已复制到剪贴板，按 Ctrl+V 粘贴".to_string()
-                                    } else {
-                                        "上屏失败：剪贴板被其他程序占用，请重试".to_string()
-                                    };
-                                    crate::notify::notify(body);
+                                    // 上屏成功不再弹通知：字已经出现在光标处，再把
+                                    // 同一个符号（常是 emoji）用系统通知展示一遍纯属
+                                    // 打扰（U-28）。只在上屏失败时才打扰用户。
+                                    if !committed && copied {
+                                        crate::notify::notify(
+                                            "已复制到剪贴板，按 Ctrl+V 粘贴",
+                                        );
+                                    } else if !committed && !copied {
+                                        crate::notify::notify(
+                                            "上屏失败：剪贴板被其他程序占用，请重试",
+                                        );
+                                    }
                                 }
                             }
                             None => {}
@@ -694,12 +726,7 @@ impl RenderedView {
                     };
                     if let Some(rect) = menu_btn {
                         if rect_contains(rect, pt_x - BLUR_RADIUS, pt_y - BLUR_RADIUS) {
-                            this.panel_visible.set(!this.panel_visible.get());
-                            if this.panel_visible.get() {
-                                this.panel_page.set(PanelPage::Menu);
-                                this.hovered_item.set(None);
-                            }
-                            Self::relayout_and_repaint(this, hwnd);
+                            Self::toggle_panel(this, hwnd);
                             return LRESULT(0);
                         }
                     }
@@ -707,6 +734,39 @@ impl RenderedView {
                 LRESULT(0)
             }
             WM_TIMER => {
+                // 面板展开/收起动画：逐帧推进，播完按方向收尾
+                // （收起动画要播完才真正收窗，展开动画播完即停在终态）。
+                if wparam.0 == PANEL_ANIM_TIMER_ID {
+                    let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
+                    if !this_ptr.is_null() {
+                        let this = &*this_ptr;
+                        if let Some(anim) = this.panel_anim.get() {
+                            let frame = anim.frame + 1;
+                            if frame >= anim.total_frames {
+                                // 最后一帧播完：清动画并落到终态。
+                                let _ = KillTimer(Some(hwnd), PANEL_ANIM_TIMER_ID);
+                                this.panel_anim_timer.set(false);
+                                this.panel_anim.set(None);
+                                if !anim.expanding {
+                                    // 收起动画结束：此刻才把面板收掉、窗口缩回候选栏。
+                                    this.collapse_panel();
+                                }
+                                Self::relayout_and_repaint(this, hwnd);
+                            } else {
+                                this.panel_anim.set(Some(PanelAnim {
+                                    expanding: anim.expanding,
+                                    frame,
+                                    total_frames: anim.total_frames,
+                                }));
+                                Self::relayout_and_repaint(this, hwnd);
+                            }
+                        } else {
+                            // 兜底：没有动画状态就不该有定时器在跑。
+                            let _ = KillTimer(Some(hwnd), PANEL_ANIM_TIMER_ID);
+                            this.panel_anim_timer.set(false);
+                        }
+                    }
+                }
                 // 语音页轮询：聆听中把 partial 文本刷到面板上（没变化就不重绘）。
                 if wparam.0 == VOICE_TIMER_ID {
                     let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
@@ -786,12 +846,13 @@ impl RenderedView {
                         || page.is_grid_page()
                         || page == PanelPage::VoiceInput;
                     if this.panel_visible.get() && hoverable {
-                        let (panel_width, bar_height, panel_height) = panel_metrics(this);
+                        let (bar_width, _bar_height, panel_width, panel_height, panel_side) =
+                            panel_metrics(this);
                         let hovered_item = match window_to_panel(
-                            BLUR_RADIUS,
-                            bar_height,
+                            bar_width,
                             panel_width,
                             panel_height,
+                            panel_side,
                             pt_x,
                             pt_y,
                         ) {
@@ -862,16 +923,17 @@ impl RenderedView {
                                 .as_ref()
                                 .is_some_and(|m| candidate_item_at(&model, m, px, py).is_some())
                         };
-                        let (panel_width, bar_height, panel_height) = panel_metrics(this);
+                        let (bar_width, _bar_height, panel_width, panel_height, panel_side) =
+                            panel_metrics(this);
                         let over_interactive = over_candidate
                             || menu_btn.is_some_and(|rect| {
                                 rect_contains(rect, px - BLUR_RADIUS, py - BLUR_RADIUS)
                             })
                             || window_to_panel(
-                                BLUR_RADIUS,
-                                bar_height,
+                                bar_width,
                                 panel_width,
                                 panel_height,
+                                panel_side,
                                 px,
                                 py,
                             )
@@ -904,6 +966,114 @@ impl RenderedView {
             WM_DESTROY => LRESULT(0),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+
+    /// 取包含指定屏幕点的显示器工作区（物理像素）；失败返回 None。
+    fn work_area_at(point: POINT) -> Option<WorkArea> {
+        // SAFETY: 坐标按值传入；MONITORINFO 在栈上且 cbSize 已填。
+        unsafe {
+            let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                let rc = mi.rcWork;
+                Some(WorkArea {
+                    left: rc.left,
+                    top: rc.top,
+                    right: rc.right,
+                    bottom: rc.bottom,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    /// 改尺寸 + 择位，一次 SetWindowPos 完成。
+    ///
+    /// 候选栏的尺寸由内容决定（候选行数、面板是否展开），位置由插入点决定；
+    /// 两者一改就得一起重算——否则面板展开后窗口只是「原地变大」，底部与右侧
+    /// 会直接顶出屏幕（U-11）。`w`/`h` 是含模糊外扩的物理像素尺寸。
+    ///
+    /// `anchor_changed` 表示插入点是否变了。没变且原位放得下时**不挪窗口**：
+    /// 候选数在几个到十个之间跳、窗口高度跟着跳，但用户看到的光标没动，窗口
+    /// 上边界就不该跟着跳（那就是「忽上忽下」，见 `layout::place_window_sticky`）。
+    ///
+    /// 没有锚点（窗口还没收到过 WM_SHOW_CANDIDATE）时退回「只改尺寸、交给
+    /// WM_WINDOWPOSCHANGING 的 clamp 兜底」。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 UI 线程调用，`hwnd` 必须是本候选栏窗口。
+    unsafe fn set_size_and_place(
+        this: &CandidateWindow,
+        hwnd: HWND,
+        w: i32,
+        h: i32,
+        anchor_changed: bool,
+    ) {
+        let placed = match this.anchor.get() {
+            Some(anchor) => Self::work_area_at(POINT {
+                x: anchor.0,
+                y: anchor.1,
+            })
+            .map(|work| {
+                place_window_sticky(
+                    anchor,
+                    w,
+                    h,
+                    Self::get_dpi_for_window(hwnd),
+                    work,
+                    this.placement.get(),
+                    anchor_changed,
+                )
+            }),
+            None => None,
+        };
+
+        match placed {
+            Some(placement) => {
+                this.placement.set(Some(placement));
+                // 尺寸与位置都没变就什么都不做：每次按键都 SetWindowPos 会让
+                // DWM 重新合成一遍，是打字「闪」的另一个来源。
+                if Self::window_matches(hwnd, placement.x, placement.y, w, h) {
+                    return;
+                }
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    placement.x,
+                    placement.y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
+            }
+            None => {
+                this.placement.set(None);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    w,
+                    h,
+                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
+            }
+        }
+    }
+
+    /// 窗口当前的位置与尺寸是否已经是 `(x, y, w, h)`。
+    fn window_matches(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
+        let mut rc = RECT::default();
+        // SAFETY: hwnd 在窗口过程内有效；rc 在栈上。
+        if unsafe { GetWindowRect(hwnd, &mut rc) }.is_err() {
+            return false;
+        }
+        rc.left == x && rc.top == y && rc.right - rc.left == w && rc.bottom - rc.top == h
     }
 
     pub(crate) fn get_dpi_for_window(hwnd: HWND) -> f32 {
@@ -999,6 +1169,7 @@ impl RenderedView {
     unsafe fn toggle_voice(this: &CandidateWindow, hwnd: HWND) {
         if this.voice.borrow().state == SpeechState::Listening {
             speech::SpeechEngine::global_stop();
+            Self::cancel_panel_anim(this, hwnd);
             this.collapse_panel();
             Self::leave_voice_page(this, hwnd, false);
         } else {
@@ -1006,6 +1177,57 @@ impl RenderedView {
             this.refresh_voice(false);
         }
         Self::relayout_and_repaint(this, hwnd);
+    }
+
+    /// 切换面板展开/收起（菜单按钮与面板快捷键共用，含动画与防抖）。
+    ///
+    /// 动画进行中再触发：直接落到目标态，不叠加动画（防抖）。
+    fn toggle_panel(this: &CandidateWindow, hwnd: HWND) {
+        // 动画进行中再点：直接落到目标态，不叠加动画（防抖）。
+        if this.panel_anim.get().is_some() {
+            unsafe { Self::cancel_panel_anim(this, hwnd) };
+            if this.panel_visible.get() {
+                // 收起动画中触发 → 留在展开态。
+                unsafe { Self::relayout_and_repaint(this, hwnd) };
+            } else {
+                // 展开动画中触发 → 直接收起。
+                this.collapse_panel();
+                unsafe { Self::relayout_and_repaint(this, hwnd) };
+            }
+            return;
+        }
+        this.panel_visible.set(!this.panel_visible.get());
+        if this.panel_visible.get() {
+            this.panel_page.set(PanelPage::Menu);
+            this.hovered_item.set(None);
+        }
+        // 展开/收起都播一段淡入淡出 + 滑入滑出动画；
+        // 收起要等动画播完才真正收窗（见 WM_TIMER 分支）。
+        this.panel_anim.set(Some(PanelAnim {
+            expanding: this.panel_visible.get(),
+            frame: 0,
+            total_frames: PANEL_ANIM_FRAMES,
+        }));
+        unsafe {
+            if SetTimer(Some(hwnd), PANEL_ANIM_TIMER_ID, PANEL_ANIM_FRAME_MS, None) != 0 {
+                this.panel_anim_timer.set(true);
+            }
+        }
+        unsafe { Self::relayout_and_repaint(this, hwnd) };
+    }
+
+    /// 打断进行中的面板动画（若在跑）：停定时器、清状态。
+    /// 面板随之直接落到当前状态（不打动画）；在收起动画中打断 = 留在展开态。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 UI 线程调用，`hwnd` 必须是本候选栏窗口。
+    unsafe fn cancel_panel_anim(this: &CandidateWindow, hwnd: HWND) {
+        if this.panel_anim.get().is_some() {
+            let _ = KillTimer(Some(hwnd), PANEL_ANIM_TIMER_ID);
+            this.panel_anim.set(None);
+            this.panel_anim_timer.set(false);
+        }
     }
 
     /// 按当前面板状态重算窗口尺寸、缓存布局结果并重绘。
@@ -1025,15 +1247,32 @@ impl RenderedView {
         if let Ok(metrics) =
             calculate_client_rect(&view.dwrite_factory, &model, dpi, this.panel_layout_page())
         {
+            // 面板从展开收回到收起时窗口会明显缩小：粘滞择位会认为「原位放得下」
+            // 而原地缩窗，候选栏就停在面板展开时窗口的顶部位置、浮在半空（实机
+            // bug：横向收起后面板不回光标）。此时必须当作「插入点变了」重新择位，
+            // 让候选栏贴回插入行。
+            let had_panel = this
+                .metrics
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.panel_side.is_some());
+            let panel_collapsed = had_panel && metrics.panel_side.is_none();
+            // 面板处于展开状态时（含菜单→二级页切换、语音页状态刷新），窗口尺寸
+            // 随页面内容变化：必须始终以插入点为锚重新择位，让窗口朝「远离光标」
+            // 的方向生长——上方布局窗口底边钉在光标上沿、面板向上长；下方布局
+            // 窗口顶边钉在光标下沿。若走粘滞「原位改尺寸」，窗口会向下/向右生长：
+            // 面板盖住正在输入的文字，或把候选条带推离光标（实机 bug：二级菜单
+            // 切换后位置错乱）。重新择位是确定性的（同一锚点+尺寸+上下偏好得到
+            // 同一位置），hover/翻页等尺寸不变的 relayout 不会引起窗口挪动。
+            // 面板全关时保持粘滞，候选数跳变仍不挪窗。
+            let panel_open = metrics.panel_side.is_some();
             *this.metrics.borrow_mut() = Some(metrics.clone());
-            let _ = SetWindowPos(
+            Self::set_size_and_place(
+                this,
                 hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
                 metrics.hw_width as i32,
                 metrics.hw_height as i32,
-                SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                panel_collapsed || panel_open,
             );
             if !model.items.is_empty() {
                 let list = this.panel_list.borrow();
@@ -1045,6 +1284,7 @@ impl RenderedView {
                     dpi,
                     &metrics,
                     this.panel_paint_state(),
+                    this.panel_progress(),
                     &list,
                     &grid,
                     &voice,
@@ -1054,15 +1294,22 @@ impl RenderedView {
     }
 }
 
-/// 读取缓存的布局结果中面板命中测试所需的 (面板宽, 候选栏高, 面板高)。
+/// 读取缓存的布局结果中面板命中测试所需的
+/// (候选栏宽, 候选栏高, 面板内容宽, 面板高, 面板方向)。
 /// 面板高按当前页面取（「剪切板」子页比菜单页高）；无缓存（尚未绘制过候选）时
 /// 面板宽度为 0，命中测试自然落空。
-fn panel_metrics(this: &CandidateWindow) -> (f32, f32, f32) {
+fn panel_metrics(this: &CandidateWindow) -> (f32, f32, f32, f32, PanelSide) {
     let page = this.panel_page.get();
     let metrics = this.metrics.borrow();
     match metrics.as_ref() {
-        Some(m) => (m.width, m.bar_height, panel_height(page)),
-        None => (0.0, 0.0, panel_height(page)),
+        Some(m) => (
+            m.width - m.panel_content_width,
+            m.bar_height,
+            m.panel_content_width,
+            panel_height(page),
+            m.panel_side.unwrap_or(PanelSide::Right),
+        ),
+        None => (0.0, 0.0, 0.0, panel_height(page), PanelSide::Right),
     }
 }
 
