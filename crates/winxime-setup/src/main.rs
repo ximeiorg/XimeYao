@@ -13,15 +13,10 @@ mod toast;
 
 fn main() {
     let process_start = std::time::Instant::now();
-    // 设置进程日志（%APPDATA%\xime\logs\setup.log；GUI 进程无控制台可看）。
-    xime_config::init_logging_with_console("setup");
-    // 冷启动计时锚点：与 server.log 的「启动设置程序」时间戳对齐，两者之差
-    // 就是「进程创建 + DLL 装载 + 日志初始化」这段看不到的开销。
-    tracing::info!(
-        "setup 进程冷启动：日志就绪 +{}ms（对齐 server.log 的启动设置程序时间戳）",
-        process_start.elapsed().as_millis()
-    );
-
+    // 元数据必须**先于**日志初始化注入：init_logging 会经 get_log_dir →
+    // get_data_dirs → default_rime_paths → app_metadata() 把 OnceLock 占成默认值
+    // （版本号 "1.0"），此后再 set_app_metadata 只会返回 Err，而关于页读的就是
+    // 那份元数据——用户会看到「v1.0」而不是真实版本。
     let _ = set_app_metadata(AppMetadata {
         display_name: "曦码·曜",
         settings_name: "曦码·曜 设置",
@@ -35,6 +30,16 @@ fn main() {
         app_name: "rime.xime.setup",
         version: env!("CARGO_PKG_VERSION"),
     });
+
+    // 设置进程日志（%APPDATA%\xime\logs\setup.log；GUI 进程无控制台可看）。
+    xime_config::init_logging_with_console("setup");
+    // 冷启动计时锚点：与 server.log 的「启动设置程序」时间戳对齐，两者之差
+    // 就是「进程创建 + DLL 装载 + 日志初始化」这段看不到的开销。
+    tracing::info!(
+        "setup 进程冷启动：日志就绪 +{}ms（对齐 server.log 的启动设置程序时间戳）",
+        process_start.elapsed().as_millis()
+    );
+
     const MUTEX_NAME: &str = "XimeSetupSingleInstanceMutex";
     const WINDOW_CLASS: &str = "GPUI Window";
     const WINDOW_TITLE: &str = "曦码·曜 设置";

@@ -3059,7 +3059,6 @@ dependencies = [
 [[package]]
 name = "librime"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "librime-sys2",
  "once_cell",
@@ -3070,7 +3069,6 @@ dependencies = [
 [[package]]
 name = "librime-sys2"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "pkg-config",
  "windows 0.62.2",
@@ -7228,7 +7226,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-ipc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "interprocess",
  "serde",
@@ -7238,7 +7236,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bzip2-rs",
@@ -7262,7 +7260,7 @@ dependencies = [
  "windows-numerics",
  "winxime-ipc",
  "xime-config",
- "xime-p2p",
+ "xime-p2p 0.1.0 (git+https://github.com/ximeiorg/libximep2p.git?rev=b19ecdec2c0336669897cafe909541906024dc29)",
  "xime-plugin",
  "xime-rime",
  "xime-speech",
@@ -7271,7 +7269,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-setup"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "tracing",
  "windows 0.62.2",
@@ -7284,7 +7282,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-tsf"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "librime",
@@ -7298,7 +7296,7 @@ dependencies = [
 
 [[package]]
 name = "winxime-tsf-register"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -7397,7 +7395,6 @@ checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
 [[package]]
 name = "xime-config"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "filetime",
  "hex",
@@ -7436,13 +7433,38 @@ dependencies = [
  "tokio",
  "tracing",
  "x25519-dalek",
- "xime-sync-domain",
+ "xime-sync-domain 0.1.0 (git+https://github.com/ximeiorg/libximep2p.git?rev=b19ecdec2c0336669897cafe909541906024dc29)",
+]
+
+[[package]]
+name = "xime-p2p"
+version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximep2p.git?rev=ca07a02c73edcb56fefb4aaf7eda45d6c720a24f#ca07a02c73edcb56fefb4aaf7eda45d6c720a24f"
+dependencies = [
+ "base64 0.23.1",
+ "chacha20poly1305 0.11.0",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "snow",
+ "socket2",
+ "spake2",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "x25519-dalek",
+ "xime-sync-domain 0.1.0 (git+https://github.com/ximeiorg/libximep2p.git?rev=ca07a02c73edcb56fefb4aaf7eda45d6c720a24f)",
 ]
 
 [[package]]
 name = "xime-plugin"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
@@ -7468,7 +7490,6 @@ dependencies = [
 [[package]]
 name = "xime-rime"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "librime",
  "librime-sys2",
@@ -7478,7 +7499,6 @@ dependencies = [
 [[package]]
 name = "xime-setup-lib"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7502,7 +7522,7 @@ dependencies = [
  "windows-core 0.62.2",
  "windows-future",
  "xime-config",
- "xime-p2p",
+ "xime-p2p 0.1.0 (git+https://github.com/ximeiorg/libximep2p.git?rev=ca07a02c73edcb56fefb4aaf7eda45d6c720a24f)",
  "xime-plugin",
  "zip 8.6.0",
 ]
@@ -7510,7 +7530,6 @@ dependencies = [
 [[package]]
 name = "xime-speech"
 version = "0.1.0"
-source = "git+https://github.com/ximeiorg/libximecore.git?rev=04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee#04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee"
 dependencies = [
  "sherpa-onnx",
  "thiserror 2.0.21",
@@ -7520,6 +7539,19 @@ dependencies = [
 name = "xime-sync-domain"
 version = "0.1.0"
 source = "git+https://github.com/ximeiorg/libximep2p.git?rev=b19ecdec2c0336669897cafe909541906024dc29#b19ecdec2c0336669897cafe909541906024dc29"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
+name = "xime-sync-domain"
+version = "0.1.0"
+source = "git+https://github.com/ximeiorg/libximep2p.git?rev=ca07a02c73edcb56fefb4aaf7eda45d6c720a24f#ca07a02c73edcb56fefb4aaf7eda45d6c720a24f"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
