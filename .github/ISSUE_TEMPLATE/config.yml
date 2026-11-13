@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用问题先看这里
+    url: https://github.com/ximeiorg/XimeYao#readme
+    about: README 里有配置说明、数据目录结构与打包方式，多数「怎么用」的问题这里已有答案。
+  - name: 已知问题与排期
+    url: https://github.com/ximeiorg/XimeYao/blob/main/PROGRESS.md
+    about: 项目维护者维护的进度与未决表（中文），可查到你提的问题是否已在处理。

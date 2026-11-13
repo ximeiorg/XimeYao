@@ -1,0 +1,136 @@
+name: 缺陷反馈（Bug）
+description: 反馈输入法行为不符合预期的问题。必填信息缺失会拖慢排查，请尽量填全。
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！下面几项直接决定我们能不能复现：
+
+        - **客户端版本**：设置 → 关于页里显示的版本号（MSI 包名形如 `ximeyao-0.5.0-x86_64.msi`）
+        - **系统版本**：Windows 版本 + 系统内部版本号（如 Windows 11 专业版 10.0.26100）
+        - **所用输入方案**：如 wubi86 / wubi98 / 万象 / 墨奇等
+        - **日志**：`%APPDATA%\Xime\logs\server.log` 里出问题时间附近的片段
+
+        未标注「已验证」的字段我们会当作「未确认」处理。
+
+  - type: input
+    id: client-version
+    attributes:
+      label: 客户端版本
+      description: 设置 → 关于页显示的版本号，例如 0.5.0
+      placeholder: 0.5.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows 8.1
+        - Windows 7 / 更早
+        - 其它
+    validations:
+      required: true
+
+  - type: input
+    id: os-build
+    attributes:
+      label: 系统版本号
+      description: winver 里的「版本」号，例如 10.0.26100
+      placeholder: 10.0.26100
+    validations:
+      required: true
+
+  - type: input
+    id: schema
+    attributes:
+      label: 所用输入方案
+      description: 出问题的那套方案；内置方案直接写名字，第三方方案请附来源链接
+      placeholder: wubi86
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 问题模块
+      options:
+        - 上屏 / 选字
+        - 候选栏
+        - 设置程序
+        - 托盘图标 / 通知
+        - 方案部署 / 方案市场
+        - 词库 / 词典管理
+        - 语音输入
+        - 剪贴板同步
+        - 安装 / 卸载 / 升级
+        - 其它
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期实现
+      description: 你期望发生什么
+      placeholder: 输入四个字后按空格，应该上屏这四个字
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际问题
+      description: 实际发生了什么；报错请贴原文
+      placeholder: 按空格后候选栏关闭但什么都没上屏
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现路径
+      description: 从打开输入法开始，逐步写；写明每一步的按键与输入内容
+      placeholder: |
+        1. 切到曦码·曜输入法
+        2. 输入 wubi86 方案，输入 nihao
+        3. 按空格
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: 复现频率
+      options:
+        - 每次都这样
+        - 偶发
+        - 只出现过一次
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: |
+        可选。`%APPDATA%\Xime\logs\server.log` 中出问题时间附近的内容。
+        注意先删除其中的个人信息（账号、路径、聊天内容）。
+    placeholder: |
+      [2026-11-12 10:10:37] ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: |
+        可选。截图请直接粘贴图片；其他线索（是否只在某个应用里出现、是否与某个设置有关）写这里。
+    validations:
+      required: false
