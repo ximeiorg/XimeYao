@@ -121,8 +121,8 @@ body:
       description: |
         可选。`%APPDATA%\Xime\logs\server.log` 中出问题时间附近的内容。
         注意先删除其中的个人信息（账号、路径、聊天内容）。
-    placeholder: |
-      [2026-11-12 10:10:37] ...
+      placeholder: |
+        [2026-11-12 10:10:37] ...
     validations:
       required: false
 

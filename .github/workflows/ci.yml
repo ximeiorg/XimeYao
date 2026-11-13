@@ -213,3 +213,5 @@ jobs:
         run: node scripts/doccheck.mjs
       - name: refcheck
         run: node scripts/refcheck.mjs
+      - name: issueform-check
+        run: node scripts/issueform-check.mjs
