@@ -1,0 +1,46 @@
+name: 使用问题（Question）
+description: 询问使用方法、配置方式、版本差异等。不确定是不是缺陷的，先在这里问。
+title: "[Question] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提问前请先看仓库 README 里的「用户配置（`xime.custom.yaml`）」与「数据目录结构」两节。
+
+        如果实际行为与文档不符或明显出错，请改用「缺陷反馈（Bug）」模板，那个模板能收集到复现所需的信息。
+
+  - type: input
+    id: client-version
+    attributes:
+      label: 客户端版本
+      description: 设置 → 关于页显示的版本号
+      placeholder: 0.5.0
+    validations:
+      required: true
+
+  - type: input
+    id: schema
+    attributes:
+      label: 所用输入方案
+      placeholder: wubi86
+    validations:
+      required: false
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 问题
+      description: 你想知道什么
+      placeholder: 怎么让候选栏只显示 5 个字？
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: 已尝试的做法
+      description: 可选。你查过哪些文档、改过哪些配置
+      placeholder: 改过 xime.custom.yaml 的 style 段
+    validations:
+      required: false
