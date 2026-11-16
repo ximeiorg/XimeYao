@@ -3,10 +3,21 @@
 > 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
 > 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
 
+## D-017 0.5.0 以 tag 触发发布，产物校验后才对外
+
+- 日期：2026-11-16
+- 状态：生效
+- 背景：`D-015` / `D-016` 的修复都已进上游 main（`f25e5ae`），版本号早已是 0.5.0，但对外最新正式版还停在 v0.4.0（2026-11-10），远程 #12「还不能正常用吗」与 #11「好期待呀」都在等正式版。发布链路是 GitHub Actions 的 `release.yml`：`on: push tags v*` 复用 `ci.yml` 的 build job，产物由 `softprops/action-gh-release` 挂到 Release；同时还有两条 Store 流水线（`AppMetadataAutoUpdate` / `AppPackageAutoUpdate`）会一并触发。
+- 决策：① 发版以**打 tag** 为准：先等上游 main 的 CI（`Build` + `Docs`）双绿，再把 `v0.5.0` 打在 main 头上触发流水线；不用 `workflow_dispatch`（那条路径默认产出 `nightly-N` 且 `draft=true`，不适合正式版）。② 发版前确认 `Cargo.toml` 的 `workspace.package.version` 与 tag 一致、`v0.4.0` 是新 tag 的祖先（版本号单调递增）。③ 产物校验不靠「流水线绿了就算数」：把 MSI/MSIX 与各自 `.sha256` sidecar 逐一下载重算 sha256 比对，并交叉读 MSI 的 `ProductVersion` 与 MSIX 的 `AppxManifest.xml` 的 `Identity/@Version`，两者都必须等于 `0.5.0`。④ Release 正文由人工补写（流水线生成的 Release 正文为空），内容按「候选栏与交互 / 稳定性修复 / 关于页 / 方案与插件 / 依赖与工程 / 反馈渠道」分节，并附 compare 链接。⑤ 对外回帖（远程 #12 / #11 同步发版说明）仍按 `D-014` 由用户放行后才发。
+- 理由：tag 触发能保证「发布出去的包就是 main 上那份代码」，而 `workflow_dispatch` 允许在任意状态下产出带 `nightly-N` 名的草稿，容易混淆正式版与试验版。逐一下载重算 sha256 是因为 sidecar 由流水线在同一台机器上生成，校验一次只能证明文件没在传输中损坏；重算并交叉读包内版本号，才能证明「这个 0.5.0 包里的版本号确实是 0.5.0」——这正是 U-38 那类「显示 1.0」缺陷的同类风险。Release 正文留空会让用户看不到本版改了什么，而远程 #12/#11 问的就是这个。
+- 影响与代价：发版多等一轮上游 CI（约 20 分钟）与一轮产物下载校验（约 36 MB × 2）；Store 两条流水线本次仍失败（缺 Store 凭据），与 v0.3.1/v0.3.2/v0.4.0 发版时一致，属既有状况，对外分发仍只走 GitHub Release。发布后关于页版本号、lua `/zrm`、custom 平铺三项仍需用户实机确认。
+- 遗留：实机确认三项（关于页显示 0.5.0、万象 `/zrm`、custom 补丁重新部署生效）待用户执行，步骤见 `docs/verify/2026-11-16-release-0.5.0.md` 第 6 节；剪贴板直连与设备关联的实机复测仍未做；远程 #12 / #11 的发版答复待用户放行。
+- 验证方式：上游 main CI run 43786143436 `Build`/`Docs` 双 success；Release Build run 43788307063 三个 job（`build / Build`、`build / Docs`、`Release`）全 success；Release id 446521634 资产四个，MSI sha256 `c561314c990e72a39224a0fbaa5d7bbfcf5af091ca2b31e9d81494b8975cf52d`、MSIX sha256 `16e4ddd72af4e4c3178e1a56bd81d480bb0bcf23b0a2c76f2715a159b7923155` 本机重算一致；MSI `ProductVersion=0.5.0`、MSIX `Identity Version=0.5.0.0`。证据见 `docs/verify/2026-11-16-release-0.5.0.md`。
+
 ## D-016 xime-p2p 升到协议 v2，与 libximecore 保持同一份实例
 
 - 日期：2026-11-16
-- 状态：生效（本仓已提交并通过 build/clippy/test；上游 PR `ximeiorg/XimeYao#34` 已创建，CI 双绿待合并）
+- 状态：生效（本仓已提交并通过 build/clippy/test；上游 PR `ximeiorg/XimeYao#34` **已于 2026-11-16 合并为 `f25e5ae`**，Release v0.5.0 已发布）
 - 背景：`D-015` 把 8 个 libximecore 依赖升到上游 main `e813762` 后，锁文件里出现**两份 xime-p2p**：libximecore 内部用 `ca07a02`，本仓直钉 `b19ecdec`。类型不跨界所以编译能过，但剪贴板直连与设置页「设备关联」可能各持一套身份与端口——公告端口的 `SO_REUSEADDR` 改动正是为此，说明多实例共存是需要处理的事实，不是理论风险。
 - 决策：① 本仓 `xime-p2p` 从 `b19ecdec2c0336669897cafe909541906024dc29` 升到 `ca07a02c73edcb56fefb4aaf7eda45d6c720a24f`，与 libximecore 内部一致，进程内只剩一份实例。② `ca07a02` 引入 `Event::Message { topic, payload }`（协议 v2 的通用 topic 消息，帧类型 `MsgType::Message = 0x20`），`handle_p2p_event` 的 `match` 因此不完整（编译报 `E0004`）；Windows 端只用剪贴板通道（`ClipboardSet 0x08`）、没有订阅任何 topic，故新增分支只记 `trace!` 日志不处理，行为不变。③ `Cargo.lock` 在**移走本地 `.cargo/config.toml`** 的状态下用 `cargo update --precise` 重生成，保证 git source 行完整（libximecore 7 处、xime-p2p 2 处，无 `path+file`），CI 可复现。
 - 理由：两份 p2p 实例意味着同一台机器上的剪贴板通道与配对通道可能用不同身份密钥和端口，表现为「一台能连一台连不上」这类难查的问题；统一到一份实例是唯一的根治办法。新增的 `Event::Message` 只记日志不处理，是因为 Windows 端没有订阅方，硬解析一个自己不发的主题只会引入误处理风险。
