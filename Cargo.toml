@@ -18,17 +18,17 @@ repository = "https://github.com/ximeiorg/XimeYao"
 [workspace.dependencies]
 # libximecore — git dep，钉到包含 xime-speech ModelChecksum 与词典回调 Result 的合并提交；
 # 本地开发时由 .cargo/config.toml 的 [patch] 覆盖为固定到同一提交的本地克隆。
-librime = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "librime" }
-librime-sys2 = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "librime-sys2" }
-xime-config = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "xime-config" }
-xime-rime = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "xime-rime" }
-xime-ipc = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "xime-ipc" }
-xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "xime-setup-lib" }
-xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "xime-plugin" }
-xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", rev = "04d6ca9ee558f5f2b57df5f00ffb7aa77607ecee", package = "xime-speech" }
+librime = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "librime" }
+librime-sys2 = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "librime-sys2" }
+xime-config = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-config" }
+xime-rime = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-rime" }
+xime-ipc = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-ipc" }
+xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-setup-lib" }
+xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-plugin" }
+xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-speech" }
 
 # libximep2p — 局域网直连传输层（剪贴板同步用），rev 与 xime-setup 的 pair-page 一致。
-xime-p2p = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "b19ecdec2c0336669897cafe909541906024dc29" }
+xime-p2p = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "ca07a02c73edcb56fefb4aaf7eda45d6c720a24f" }
 
 # winxime workspace crates
 winxime-tsf = { path = "crates/winxime-tsf" }

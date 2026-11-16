@@ -3,6 +3,72 @@
 > 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
 > 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
 
+## D-016 xime-p2p 升到协议 v2，与 libximecore 保持同一份实例
+
+- 日期：2026-11-16
+- 状态：生效（本仓已提交并通过 build/clippy/test；上游 PR `ximeiorg/XimeYao#34` 已创建，CI 双绿待合并）
+- 背景：`D-015` 把 8 个 libximecore 依赖升到上游 main `e813762` 后，锁文件里出现**两份 xime-p2p**：libximecore 内部用 `ca07a02`，本仓直钉 `b19ecdec`。类型不跨界所以编译能过，但剪贴板直连与设置页「设备关联」可能各持一套身份与端口——公告端口的 `SO_REUSEADDR` 改动正是为此，说明多实例共存是需要处理的事实，不是理论风险。
+- 决策：① 本仓 `xime-p2p` 从 `b19ecdec2c0336669897cafe909541906024dc29` 升到 `ca07a02c73edcb56fefb4aaf7eda45d6c720a24f`，与 libximecore 内部一致，进程内只剩一份实例。② `ca07a02` 引入 `Event::Message { topic, payload }`（协议 v2 的通用 topic 消息，帧类型 `MsgType::Message = 0x20`），`handle_p2p_event` 的 `match` 因此不完整（编译报 `E0004`）；Windows 端只用剪贴板通道（`ClipboardSet 0x08`）、没有订阅任何 topic，故新增分支只记 `trace!` 日志不处理，行为不变。③ `Cargo.lock` 在**移走本地 `.cargo/config.toml`** 的状态下用 `cargo update --precise` 重生成，保证 git source 行完整（libximecore 7 处、xime-p2p 2 处，无 `path+file`），CI 可复现。
+- 理由：两份 p2p 实例意味着同一台机器上的剪贴板通道与配对通道可能用不同身份密钥和端口，表现为「一台能连一台连不上」这类难查的问题；统一到一份实例是唯一的根治办法。新增的 `Event::Message` 只记日志不处理，是因为 Windows 端没有订阅方，硬解析一个自己不发的主题只会引入误处理风险。
+- 影响与代价：锁文件里的 `xime-p2p` 与 `xime-sync-domain` 两条目换源，并新增 `socket2` 依赖（`bind_reuse` 用它设 `SO_REUSEADDR`）；`os_pipe` 与 `winapi-util` 的 `windows-sys` 从 0.61.2 降到 0.48.0，是上游锁文件本身的差异，非本仓主动降级。协议 `PROTOCOL_VERSION` 仍为 1（上游约定发布前字段增删不加版本号），故与旧端互通未验证。
+- 遗留：剪贴板直连与设备关联的实际连通性未实机复测（需两台机器，步骤见 `docs/verify/2026-11-10-clipboard-p2p-host.md` 末节）；与旧版本客户端的互通未验证。
+- 验证方式：`cargo +nightly-2026-07-03 build --quiet` exit 0、`clippy --workspace --all-targets` 0 warning、`test --workspace` 192 passed / 0 failed / 1 ignored；锁文件用 `Select-String` 核对 git source 计数（libximecore 7、xime-p2p 2、`path+file` 0）。
+
+## D-015 默认构建启用 lua、方案包 custom 补丁平铺到 rime 根目录、关于页版本号修复
+
+- 日期：2026-11-13
+- 状态：生效（本仓改动已落地并通过 build/clippy/test；两处上游加固 `ximeiorg/libximecore#10` 与 `#11` **已合并**，本仓 rev 已升到 `64580b5`）
+- 背景：本轮由两条外部输入驱动——用户要求「默认构建时需要 lua」，并要求自证「改 `wanxiang.custom.yaml` 后重新部署无效果」是不是 bug；远程 #29 的反馈者补充「改的是 `<rime>\custom\wanxiang.custom.yaml`，客户端 0.4.0 但关于页显示 1.0」。三件事都指向真实缺陷：① librime 的 `plugins/` 目录不在 git 跟踪内，rime-lua 是独立仓，默认构建根本不会带上 lua，本仓内置方案（`wubi86` / `wubi98` / `pinyin_simp` / `wubi86_pinyin` 都引用 `lua_translator@*uuid`）的 lua 功能**一直是静默失效的**；② librime 只在**方案同目录**（rime 根目录）找 `<schema>.custom.yaml`，而方案包把补丁模板放在 `custom/` 子目录，用户改那份自然不生效；③ 关于页版本号显示 1.0，根因是 `xime-config` 的元数据用 `OnceLock`，被日志初始化提前读走默认值后再也覆盖不了。
+- 决策：① 上游 `crates/librime-sys2/build.rs` 增加 `ensure_lua_plugin()`——构建前探测 `<librime>/plugins/lua/CMakeLists.txt` 与 `<librime>/plugins/lua/thirdparty/lua5.4/lua.h`，缺失则 `git clone --depth 1` 拉 `hchunhui/librime-lua`，再 `git clone --depth 1 --branch thirdparty` 拉 lua 源码；**失败时删掉半个插件目录**，宁可退回「没有 lua」也不让 CMake 的 `FATAL_ERROR "Lua not found"` 打断整个构建。② 上游 `crates/xime-setup/src/state.rs` 增加 `flatten_schema_custom_templates()`——安装释放后把**本包自带方案**的 `custom/<schema>.custom.yaml` 平铺到 rime 根目录，根目录已有同名文件则不覆盖（保护用户已改内容），`custom/` 下副本保留（万象的 lua 把它当模板来源）。③ 本仓 `crates/winxime-setup/src/main.rs` 把 `set_app_metadata(...)` 移到 `init_logging_with_console("setup")` 之前；上游 `xime-config` 另把元数据持有者从 `OnceLock` 换成 `MetadataCell`，允许「读到默认值之后再注入一次」。④ 本仓 8 个 libximecore 依赖 rev 由 `04d6ca9` 升到上游 main `e813762`（含方案包 id 归一化、aes-gcm 弃用、clipboard-page 门控三项已合并修复）。⑤ 两个缺陷各自写回归测试：custom 平铺两个用例、 元数据注入两个用例。
+- 理由：lua 与 custom 平铺都必须在**上游 libximecore** 修——librime 是上游 core 的子模块、方案包安装逻辑在 `xime-setup` crate，本仓只有宿主壳子，改本仓等于打补丁掩盖根因；而上游 core 的 `plugins/` 不跟踪第三方插件，只能由构建脚本负责拉取（librime 自带的 `action-install-plugins-windows.bat` 需要人先设 `RIME_PLUGINS` 环境变量，CI 与发布流水线不会设）。关于页那条优先改本仓顺序，因为本仓立刻能生效且成本最低，上游加固是防同类顺序问题再犯。关于页与 lua 两处都属「用户看得见的功能静默失效」，比崩溃更隐蔽，所以宁可多写一段构建期探测，也要保证默认构建出来的 rime.dll 带 lua。
+- 影响与代价：构建期多一次 git clone（首次约几十 MB，拉不满时退回无 lua 并打 `cargo:warning`）；CI 与本机打包流程因此依赖能访问 github；方案包安装后 rime 根目录会多出 `<schema>.custom.yaml`，这是**新增文件**，用户若手动删掉再「重新部署」，安装器不会自动补回（只有重装方案包才会平铺）。本仓依赖 rev 上移带入 core 的行为变更（方案包 id 归一化会改变市场页显示的 id），需要实机复核一次。
+- 遗留：上游 PR #10（lua + custom 平铺）与 #11（元数据允许后注入）**已于 2026-11-16 合并**，本仓 8 个 core 依赖 rev 已升到上游 main `64580b5`，0.5.0 发布包会带 lua，#29 的 `/zrm` 应当可用——**待用户实机复测确认**。关于页版本号改动尚未实机确认（需用户打开设置页「关于」查看）。U-33 / U-35 的实机复现仍未做。
+- 验证方式：本仓 `cargo +nightly-2026-07-03 build --quiet` exit 0、`clippy --workspace --all-targets` 0 warning、`test --workspace` 192 passed / 0 failed / 1 ignored；上游 `cargo +1.95 test -p xime-setup-lib` 50 passed（含两个 custom 平铺用例）、`cargo +1.95 test -p xime-config metadata` 4 passed（含两个元数据注入用例）、`clippy -p xime-config --all-targets` 无本次引入的新告警。证据见 `docs/verify/2026-11-13-issue-templates-and-remote-issues.md` 第 7 节。
+
+## D-014 远程 issue 先本地取证，回复与标签由用户放行
+
+- 日期：2026-11-13
+- 状态：生效
+- 背景：`D-012` 把远程 5 个 issue 登记为 U-33 ~ U-37 时，「处置」列写的是**假设方向**——当时只读到代码片段，没有把每个 issue 的行为路径走通，远程用户的真实场景（哪个应用、是否组词中、按哪个数字区、用哪个方案）也还没问到。按 `WORKFLOW.md §4` 的三档处置要求，假设不能当结论。2026-11-13 本轮把 5 个 issue 逐条做了只读取证，并把回复草稿备好。
+- 决策：① 本轮**只读代码与本机配置文件**完成 U-33 ~ U-37 取证，结论写进 `PROGRESS.md` 未决表的「处置」列与验证档案第 6 节；② 远程 issue 的**回复与打标签一律不自动执行**——草稿只存本地，等用户过目后再发；③ 本轮文档改动**不 commit、不 push**，提交时机由用户定；④ 需要用户提供才能定档的三个 issue（#30 / #27 / #29），先按「预期 / 动作 / 实际」追问再动手。
+- 理由：远程 issue 是外部用户写的，回复一旦发出就是公开承诺，措辞里给出的技术判断必须站得住；本轮取证虽然把机制查清了，但没有一台实机跑过用户场景，直接下结论等于把「读代码得出的推断」当「复现结论」。用户也明确要求先解决真实存在的问题、暂不打标签。回复与标签分开放行，是因为两者代价不同——回帖不可撤回，而标签事后可改。
+- 影响与代价：远程 issue 从登记到有实质回应的周期变长，用户短期内拿不到答复；`D-012` 遗留里「U-33 ~ U-35 根因只是假设」这一句已被本轮取代，但未决表里的取证结论仍属**代码层面推断**，实机复现前不作最终结论。
+- 遗留：#30 的「哪个应用 / 是否组词中 / 哪个数字区」、#27 的「版本 + 方案名 + 预期动作实际」、#29 的「是否需要 rime-lua」都待用户答复；U-36 / U-37 的发布节奏答复待正式版排期确定；「缺陷反馈（Bug）」表单在 New issue 页的渲染仍待用户人工确认。
+- 验证方式：取证证据见 `docs/verify/2026-11-13-issue-templates-and-remote-issues.md` 第 6 节（含每个结论对应的代码位置与本机配置证据）；本轮 `node scripts/doccheck.mjs`、`node scripts/refcheck.mjs`、`node scripts/issueform-check.mjs` 三机检全绿；远程未回复与未打标签由取数脚本确认（issues 仍为 5 个 open、labels 仍为空）。
+
+## D-013 issue 表单结构由机检守住，坏表单不许静默消失
+
+- 日期：2026-11-13
+- 状态：生效（上游 PR `ximeiorg/XimeYao#32` 已合并为 `f1f18e3`，CI 双绿；渲染待用户确认）
+- 背景：`D-012` 的三份表单随 PR #31 合并后，用户在 Issues → New issue 页只看到「功能建议」「使用问题」「Blank issue」，**「缺陷反馈（Bug）」整份表单不出现**，而仓库里没有任何报错。根因是 `bug_report.yml` 的 `logs` 字段把 `placeholder:` 写在了 `attributes:` 外面（元素级）；GitHub 的 issue form 是**整份表单一起校验**，任一 body 元素不合法就整份表单被静默丢弃——另外两个表单正常，更像「文件没推上去」，排查绕了不少弯路。
+- 决策：① 把 `placeholder:` 移回 `attributes:` 内；② 新增 `scripts/issueform-check.mjs`，按缩进做结构检查（顶层键白名单 `name`/`description`/`body`/`assignees`/`labels`/`title`/`type`/`projects`；body 元素键白名单 `type`/`id`/`attributes`/`validations`；各元素类型对应的 attributes 必填与允许键；validations 只允许 `required`/`min_length`；id 只能含字母数字与 `-`/`_` 且唯一；label 唯一；`config.yml` 顶层键），**不引第三方 YAML 依赖**，CI 与本机都能直接跑；③ `.github/workflows/ci.yml` 的 `docs` job 增加 `issueform-check` 步骤。
+- 理由：GitHub 对不合法的 issue form 不给任何反馈（页面不显示、仓库无报错），这种「静默失败」只能靠机检兜住，别的地方同理——凡是外部系统只消费不出声的接口，本仓都要自己留一道可执行的校验。检查器不引 YAML 依赖，是因为 `scripts/` 下现有两个机检（`doccheck.mjs`、`refcheck.mjs`）都是零依赖手写解析，再引入 `js-yaml` 会让 CI 多一次依赖安装，也和既有风格不一致。
+- 影响与代价：`scripts/` 多一个文件、CI docs job 多一步（秒级）；手写的缩进解析只覆盖本仓自己写模板时的写法（属性块固定 6 空格缩进、元素键 4 空格），换一种 YAML 排版可能漏检，但对本仓模板够用；真正的官方校验仍以 GitHub 自身为准。
+- 遗留：机检只能证明结构合法，**不能证明 GitHub 会渲染该表单**——「缺陷反馈（Bug）」在 New issue 页出现与否仍需合并后由用户在网页上确认；三个表单各自的必填项校验与下拉提交尚未逐个走查；远程 issue U-33 ~ U-37 的根因仍未本机复现。
+- 验证方式：`node scripts/issueform-check.mjs` 对四份表单通过；对合并前的旧版 `bug_report.yml` 跑同一脚本，报 `第 124 行：body 元素下出现非法键 placeholder`，即原缺陷可被复现（负向测试）；`node scripts/doccheck.mjs` 与 `node scripts/refcheck.mjs` 同批通过；上游 PR #32 的 CI `Docs` 与 `Build` 均 success。证据见 `docs/verify/2026-11-13-issue-templates-and-remote-issues.md` 第 5 节。
+
+## D-012 远程 issue 走表单模板，本地未决表登记远程编号
+
+- 日期：2026-11-13
+- 状态：生效
+- 背景：本仓对上游 `ximeiorg/XimeYao` 只有 PR 权限，远程 issue 一直由外部用户直接自由填写，已经出现描述不可复现的情况（#27 反馈「0.4 版本的万象无法上屏」，维护者只能回帖要求补「预期 / 动作 / 实际」）。同时远程 5 个 issue 在本仓 `PROGRESS.md` 里完全没有对应记录，维护者本地排期看不到外部反馈，存在重复劳动与漏排期的风险。
+- 决策：① 在 `.github/ISSUE_TEMPLATE/` 用 issue form（YAML）写三份模板——`bug_report.yml`（缺陷）、`feature_request.yml`（功能建议）、`question.yml`（提问），外加 `config.yml` 模板选择器；缺陷模板必填「客户端版本、系统类型与版本号、所用输入方案、问题模块、预期实现、实际问题、复现路径、复现频率」，可选「日志片段（`%APPDATA%\Xime\logs\server.log`）」「补充信息」；功能建议模板必填「想解决的问题、期望的使用方式、涉及模块」；提问模板必填「客户端版本、问题」。② `config.yml` 设 `blank_issues_enabled: true`（保留自由格式入口，避免把「先说说想法」的讨论卡在模板外），并用两个 `contact_links` 指向 README 与本仓 `PROGRESS.md`。③ 模板 label 只用仓库已有的 `bug` / `enhancement` / `question`，不新造标签。④ 远程已有 issue 逐条映射为本仓未决编号：#30→U-33、#29→U-34、#27→U-35、#12→U-36、#11→U-37，在 `PROGRESS.md` 未决表登记问题、状态、处置方向与下一步（排期），证据落 `docs/verify/2026-11-13-issue-templates-and-remote-issues.md`。
+- 理由：模板的价值不在于「收集更多字段」，而在于让反馈**在提交那一刻就具备可复现性**——版本、系统、方案、逐步路径四项缺失时，排查只能靠来回追问，这是远程 #27 已经发生的成本。功能建议与提问分开，是因为二者的信息需求不同：建议要的是「问题场景」，提问要的是「版本 + 环境」，混在一个模板里两边都填不全。label 复用已有值，避免维护者再多记一套标签体系。远程 issue 进本地未决表，是因为本仓的排期与验收都围绕 `PROGRESS.md` 未决表转（`WORKFLOW.md §4` 三档处置），外部反馈不进表就等于不存在；编号用 U-33 起、承接 U-32，避免与既有编号冲突。
+- 影响与代价：远程 issue 模板一旦随 PR 合并即刻生效，用户提交界面变化；`config.yml` 的 `contact_links` 指向本仓 `PROGRESS.md`，该文件随维护更新而变化，是「已知问题与排期」的唯一去处，后续维护者须保持它可用。代价是外部反馈若不经 GitHub 提交（微信/邮件等），本表不会自动收录，仍需人工搬运。本仓账号对上游无 push 权限，模板须走 PR 才能生效。
+- 遗留：U-33 ~ U-35 的根因方向目前只是假设（U-33 指向内置计算器「数字开头影子缓冲」吞掉候选选字键，U-34 指向托盘方案开关未暴露多选一 option，U-35 指向候选点选与空格/回车提交路径不一致），尚未本机复现，取证前不得当结论；模板在 GitHub 网页上的实际渲染效果需合并后人工确认；#27 附带的两张截图未细看。
+- 验证方式：`docs/verify/2026-11-13-issue-templates-and-remote-issues.md` 记录四份 YAML 的解析结果、`node scripts/doccheck.mjs` 与 `node scripts/refcheck.mjs` 双绿输出、以及远程 issue 快照的取数方式与原始条目。
+
+## D-011 方案包 id 归一化，通知与页面文案同源
+
+- 日期：2026-11-12
+- 状态：生效（上游 PR #7 已提交待合并；实机验证待用户执行）
+- 背景：用户反馈市场方案「装不上、卸不掉」，且系统通知与设置页文案不一致。日志显示三处根因：① 缓存目录按索引 id 命名，但「已下载」页把**目录名**当方案 id 返回，界面 id ≠ 索引 id ≠ 注册表 key（本机同时存在 `Moqi Wan Flypymo` / `Moqi Wan Flypymo 1.2.0` / `moqi_wan_flypymo` 三种历史目录名），卸载时按目录名查注册表就报「方案包未安装」，而文件其实已删；② `local`（用户自放的兜底记录）被当作冲突占用方，`rime-wanxiang` 因 README.md 冲突装不上；③ 成功只弹 WinRT toast、失败是 4 秒后消失的红字，两套文案两套生命周期，用户错过即「无提示」（U-31）。
+- 决策：① 引入方案包 id 归一化口径——`normalize_package_id`（忽略大小写、分隔符与版本号尾巴）+ `same_package_id`（同包判定）+ `resolve_package_key`（注册表别名查找）；索引 id 为唯一规范 id，历史目录名按归一匹配回索引 id，缓存目录定位统一走 `package_cache_dir`。② `local` 与内置方案包都不算冲突方，安装冲突只列真正占用文件的第三方包。③ 通知与页面文案同源：新增 `MarketNotice { title, body }`，在后台任务里一次性构造，toast 与页面 `install_message` 用同一份文本；失败文案按「发生了什么 / 为什么 / 下一步」组织。④ 方案结果不再自动消失（`expire_install_messages` 只回收模型/插件消息）。⑤ 下载临时文件名由 `x.zip.part.part.<pid>` 改回 `x.zip.part.<pid>`，并在索引刷新时清理遗留 `.part`。
+- 理由：id 是贯穿「索引 → 缓存目录 → 注册表 → 界面」的唯一句柄，任何一处用另一种写法都会表现为「装不上/卸不掉」；归一化放在 `xime-config`（注册表的唯一所有者）比在 UI 层打补丁更彻底。通知与文案同源是因为二者本应描述同一件事，现状是同一件事写了两遍、还各有生命周期，所以「不一致」不是文案问题而是结构问题。冲突判定收紧，是因为「一个 rime 目录只留一个包」的真实约束是**文件重叠**，不是「注册表里有别的包」。
+- 影响与代价：`xime-config` 公开面新增三个函数（`normalize_package_id` / `same_package_id` / `resolve_package_key`）；`xime-setup` 的 `MarketTaskResult` 三个变体改为携带文案，所有匹配处同步改；界面多了「安装/卸载」按钮与人类可读包名。代价是历史遗留的三种目录名要在扫描时归一，索引未加载时只能退回目录名。为便于自动化验证脚本，上游另开放了一组只读诊断入口（`set_market_schema_index` / `market_schema_display_name` / `canonical_schema_id` / `package_cache_dir` / `cleanup_stale_download_parts` / `downloaded_schema_ids` / `schema_install_conflict` / `set_market_task_result`，`MarketNotice` 字段改为 pub），它们只读或仅供注入状态，不改变业务路径。
+- 验证方式：除单元用例外，另写一次性探针脚本 `target/tmp/schema-probe/`（数据目录重定向到临时目录，不触碰真实 `%APPDATA%`，不调用 `deploy_all()`），18 项断言覆盖 id 归一、缓存目录解析、别名卸载、`local` 不阻塞、冲突过滤、页面与 toast 同文、方案结果不自动消失、失败文案含「下一步」等，全部通过；证据见 `docs/verify/2026-11-12-schema-package-install-notify.md` 第 7 节。
+- 遗留：上游改动已拆分提交为 `ximeiorg/libximecore` PR #7（`feat/schema-package-id-and-notify`，提交 `c813f89` + `40c4327`），待上游合并；顺带把 aes-gcm 弃用与「不带 features 编译 `xime-setup-lib` 失败」分别开成 PR #8、#9（后者即 `D-008` 遗留里提到的 `pair-page` 组合缺口）；`xime-config` 两个预存失败用例（`calculator::tests::parses_explicit_false_only`、`schema_manifest::tests::refresh_builtin_tracks_scheme_files_and_skips_user_data`）与本次改动无关，未擅自修；实机验证待用户执行。
+
 ## D-010 依赖钉到 libximecore 合并提交，版本升 0.4.0
 
 - 日期：2026-11-10
@@ -31,7 +97,7 @@
 - 决策：① 给 `winxime-setup` 的 `xime-setup-lib` 依赖加 `pair-page`（与 `clipboard-page` 同开）；② 不另钉 `rev`，跟随 `libximecore` 已锁的 `libximep2p` rev `b19ecde`；③ 不改上游 `xime-p2p` / `xime-setup` 代码，宿主要补的只有 `AppMetadata` 字段。
 - 理由：`pair-page` 与 `clipboard-page` 必须同开——`pair-page` 的匹配臂引用 `Message::SyncModeChanged`，而这个变体与 `sync_plugin` 字段由 `clipboard-page` 门控（`xime-setup` 的 feature 组合缺口）。XimeYao 本来就要剪贴板页，同开无额外成本。跟上游 `rev` 是因为 `b19ecde` 是 `libximecore` 自己测过的组合，宿主擅自换 rev 会把两仓的测试结论作废。
 - 影响与代价：构建期要从 GitHub 拉 `libximep2p`，离线环境会失败（`Cargo.lock` 已锁 `b19ecde`，首次要联网）；设置页多一个侧栏页，用户数据目录同级多一个 `p2p/`（身份与配对表）；安装包体积略增。
-- 遗留：`pair-page` 单独开启仍编不过（`xime-setup` 的 `app.rs` 里「配对消息」的匹配臂没加与变体一致的 `cfg` 门控，属上游问题）；上游 `b19ecde` 落后 `libximep2p` 四个提交（含协议 v2），是否升级要上游决定；配对、互传的运行时行为待两台设备实机。
+- 遗留：`pair-page` 单独开启仍编不过（`xime-setup` 的 `app.rs` 里「配对消息」的匹配臂没加与变体一致的 `cfg` 门控）——已在上游 PR #9 修复，待合并；上游 `b19ecde` 落后 `libximep2p` 四个提交（含协议 v2），是否升级要上游决定；配对、互传的运行时行为待两台设备实机。
 
 ## D-007 词典导出路径由服务端生成，导入/恢复只收白名单内文件
 
