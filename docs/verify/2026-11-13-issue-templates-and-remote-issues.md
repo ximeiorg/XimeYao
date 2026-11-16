@@ -185,4 +185,4 @@ GitHub 的 issue form 是**整份表单一起校验**——任一 body 元素不
 
 - 决策：`D-012`（模板与本地登记）、`D-013`（坏表单静默消失的根因与新增机检）、`D-014`（远程 issue 先本地取证、回复与标签由用户放行）、`D-015`（默认构建启用 lua、方案包 custom 补丁平铺、关于页版本号）、`D-016`（xime-p2p 升到协议 v2，与 libximecore 保持同一份实例）。
 - 未决映射见 `PROGRESS.md` 未决表 U-33 ~ U-37。
-- 上游 PR：`ximeiorg/libximecore#10`（lua 插件 + custom 平铺，**已合并**）、`ximeiorg/libximecore#11`（元数据允许在读到默认值后再注入，**已合并**）、`ximeiorg/XimeYao#34`（本仓：关于页版本号修复 + rev 升 `64580b5` + xime-p2p `ca07a02` + docs 首次随代码上上游，**已创建待合并**）。
+- 上游 PR：`ximeiorg/libximecore#10`（lua 插件 + custom 平铺，**已合并**）、`ximeiorg/libximecore#11`（元数据允许在读到默认值后再注入，**已合并**）、`ximeiorg/XimeYao#34`（本仓：关于页版本号修复 + rev 升 `64580b5` + xime-p2p `ca07a02` + docs 首次随代码上上游，**已创建，CI 双绿待合并**）。

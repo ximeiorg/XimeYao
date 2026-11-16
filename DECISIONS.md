@@ -6,7 +6,7 @@
 ## D-016 xime-p2p 升到协议 v2，与 libximecore 保持同一份实例
 
 - 日期：2026-11-16
-- 状态：生效（本仓已提交并通过 build/clippy/test；上游 PR `ximeiorg/XimeYao#34` 已创建待合并）
+- 状态：生效（本仓已提交并通过 build/clippy/test；上游 PR `ximeiorg/XimeYao#34` 已创建，CI 双绿待合并）
 - 背景：`D-015` 把 8 个 libximecore 依赖升到上游 main `e813762` 后，锁文件里出现**两份 xime-p2p**：libximecore 内部用 `ca07a02`，本仓直钉 `b19ecdec`。类型不跨界所以编译能过，但剪贴板直连与设置页「设备关联」可能各持一套身份与端口——公告端口的 `SO_REUSEADDR` 改动正是为此，说明多实例共存是需要处理的事实，不是理论风险。
 - 决策：① 本仓 `xime-p2p` 从 `b19ecdec2c0336669897cafe909541906024dc29` 升到 `ca07a02c73edcb56fefb4aaf7eda45d6c720a24f`，与 libximecore 内部一致，进程内只剩一份实例。② `ca07a02` 引入 `Event::Message { topic, payload }`（协议 v2 的通用 topic 消息，帧类型 `MsgType::Message = 0x20`），`handle_p2p_event` 的 `match` 因此不完整（编译报 `E0004`）；Windows 端只用剪贴板通道（`ClipboardSet 0x08`）、没有订阅任何 topic，故新增分支只记 `trace!` 日志不处理，行为不变。③ `Cargo.lock` 在**移走本地 `.cargo/config.toml`** 的状态下用 `cargo update --precise` 重生成，保证 git source 行完整（libximecore 7 处、xime-p2p 2 处，无 `path+file`），CI 可复现。
 - 理由：两份 p2p 实例意味着同一台机器上的剪贴板通道与配对通道可能用不同身份密钥和端口，表现为「一台能连一台连不上」这类难查的问题；统一到一份实例是唯一的根治办法。新增的 `Event::Message` 只记日志不处理，是因为 Windows 端没有订阅方，硬解析一个自己不发的主题只会引入误处理风险。

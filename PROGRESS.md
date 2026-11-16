@@ -86,12 +86,12 @@
 | 2026-11-13 | 缺陷表单缺失根因与新增 issue 表单机检（`D-013`） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) | 根因证实（`placeholder` 位置错误 → GitHub 静默丢弃整份表单）；issueform-check 正/负向测试通过；doccheck/refcheck/issueform-check 三机检全绿；**上游 PR #32 已合并（`f1f18e3`，CI 双绿），渲染待用户人工确认** |
 | 2026-11-13 | 远程 issue 取证（U-33 ~ U-37）：数字键归属、`/zrm` 的 lua 依赖、空格/回车与方案按键绑定 | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) 第 6 节 | 纯代码与配置文件取证（未运行程序）：5 条结论已写入未决表「处置」列；**第四轮按用户放行，5 条回复与标签已发布** |
 | 2026-11-13 | 默认构建启用 lua + 方案包 custom 补丁平铺 + 关于页版本号修复 + 依赖 rev 升 `e813762`（`D-015`） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) 第 7 节 | 本仓 build exit 0 / clippy 0 warning / test 192 passed；上游 `xime-setup-lib` 50 passed（含两个 custom 平铺用例）、`xime-config metadata` 4 passed；**上游 PR #10、#11 已于 2026-11-16 合并** |
-| 2026-11-16 | xime-p2p 升到 `ca07a02`（协议 v2）+ libximecore 升 `64580b5`（#10 #11 已合并）+ 上游 PR #34（`D-015` / `D-016`） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) 第 7 节 | build exit 0 / clippy 0 warning / test 192 passed（0 failed、1 ignored）；`Cargo.lock` 在移走本地 `[patch]` 的状态下重生成，git source 完整（libximecore 7、xime-p2p 2、`path+file` 0）；**上游 PR #34 已创建待合并；剪贴板直连与设备关联未实机复测** |
+| 2026-11-16 | xime-p2p 升到 `ca07a02`（协议 v2）+ libximecore 升 `64580b5`（#10 #11 已合并）+ 上游 PR #34（`D-015` / `D-016`） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) 第 7 节 | build exit 0 / clippy 0 warning / test 192 passed（0 failed、1 ignored）；`Cargo.lock` 在移走本地 `[patch]` 的状态下重生成，git source 完整（libximecore 7、xime-p2p 2、`path+file` 0）；**上游 PR #34 的 CI 已双绿（Build + Docs 均 success，run 116）；剪贴板直连与设备关联未实机复测** |
 
 ## 下一步
 
 - 输入功能批次第一批：U-25 简繁转换（librime opencc 大概率原生）→ U-18 五笔整句开关 → U-23 反查（schema 配置批）；或 U-8/U-17 关于页文案（等用户给具体文字）。
-- **0.5.0 发布**：上游 `ximeiorg/libximecore#10`（lua + custom 平铺）与 `#11`（元数据）**已合并**，本仓 rev 已升到 `64580b5`，发布包会带 lua；发布前确认上游 PR `ximeiorg/XimeYao#34` 已合并。关于页版本号显示 0.5.0 需用户实机确认。
+- **0.5.0 发布**：上游 `ximeiorg/libximecore#10`（lua + custom 平铺）与 `#11`（元数据）**已合并**，本仓 rev 已升到 `64580b5`，发布包会带 lua；上游 PR `ximeiorg/XimeYao#34` 的 **CI 已双绿（Build + Docs success）**，等上游合并后即可打 `v0.5.0` tag 触发 Release Build 流水线。关于页版本号显示 0.5.0 需用户实机确认。
 - 本批代码与文档改动走 PR 送上上游 `ximeiorg/XimeYao`（本机账号对上游有 push 权限，但按约定仍走 PR）；PR 合入后再按上面的条件升一次 rev 发 0.5.0。
 - 剪贴板直连与设备关联因 xime-p2p 升级需要实机复测一次（两台机器，步骤见 `docs/verify/2026-11-10-clipboard-p2p-host.md` 末节）。
 - 远程 issue 回复已发出，等用户回话：#30 等三个问题的答案、#27 等版本与「预期/动作/实际」、#29 等万象版本与复测结果。
