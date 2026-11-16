@@ -803,6 +803,13 @@ fn handle_p2p_event(
             did
         ),
         Event::Warning(w) => warn!("局域网直连：{}", w),
+        // 协议 v2 起的通用 topic 消息（0x20）。Windows 端目前只用剪贴板通道
+        // （走 ClipboardSet 0x08），没有订阅任何 topic，因此先记日志不处理。
+        Event::Message { topic, payload } => trace!(
+            "局域网直连收到 topic 消息（{}，{} 字节），Windows 端暂不订阅",
+            topic,
+            payload.len()
+        ),
     }
 }
 
