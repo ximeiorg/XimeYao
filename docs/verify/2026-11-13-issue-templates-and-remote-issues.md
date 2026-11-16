@@ -152,7 +152,7 @@ GitHub 的 issue form 是**整份表单一起校验**——任一 body 元素不
 
 ### 7.4 本仓依赖升级
 
-`Cargo.toml` 的 8 个 libximecore 依赖 rev 由 `04d6ca9` 升到上游 main `e813762cd215ad9ca330ab30a2b158f47512c8de`（含 PR #7 方案包 id 归一化、#8 aes-gcm 弃用、#9 clipboard-page 门控修复）。`xime-p2p` 一并由 `b19ecde` 升到 `ca07a02`（2026-11-16，`D-016`）：升 libximecore rev 后锁文件里会出现两份 xime-p2p（core 内部已是 `ca07a02`），本仓统一到同一份实例；`ca07a02` 新增 `Event::Message { topic, payload }`（协议 v2 通用 topic 消息，帧类型 `MsgType::Message = 0x20`），`handle_p2p_event` 的 `match` 因此报 `E0004`，Windows 端只用剪贴板通道（`ClipboardSet 0x08`）、未订阅 topic，故新增分支只记 `trace!` 日志、行为不变。本仓三项机检在该 rev 上全绿：
+`Cargo.toml` 的 8 个 libximecore 依赖 rev 由 `04d6ca9` 升到上游 main `64580b580e453a288c7fec053e0849ed05c3282e`（含 PR #7 方案包 id 归一化、#8 aes-gcm 弃用、#9 clipboard-page 门控修复、**#10 lua 默认启用与 custom 补丁平铺**、**#11 元数据允许后注入**）。`xime-p2p` 一并由 `b19ecde` 升到 `ca07a02`（2026-11-16，`D-016`）：升 libximecore rev 后锁文件里会出现两份 xime-p2p（core 内部已是 `ca07a02`），本仓统一到同一份实例；`ca07a02` 新增 `Event::Message { topic, payload }`（协议 v2 通用 topic 消息，帧类型 `MsgType::Message = 0x20`），`handle_p2p_event` 的 `match` 因此报 `E0004`，Windows 端只用剪贴板通道（`ClipboardSet 0x08`）、未订阅 topic，故新增分支只记 `trace!` 日志、行为不变。本仓三项机检在该 rev 上全绿：
 
 | 平台（含版本） | 命令或步骤 | 实际输出 | 覆盖范围 |
 | --- | --- | --- | --- |
@@ -176,8 +176,8 @@ GitHub 的 issue form 是**整份表单一起校验**——任一 body 元素不
 - 模板在 GitHub 网页上的渲染已由用户截图确认（模板选择器可用）；**三个表单各自的必填项校验与下拉提交**尚未逐个走查。
 - 远程 issue 的行为根因（U-33 ~ U-35）本轮为**代码与配置文件层面的取证**，尚未本机复现：U-33 的「哪个应用 / 是否组词中 / 哪个数字区」仍待用户回答；U-34 的 rime-lua 需求与万象是否在方案清单内待用户回答；U-35 待用户补版本与「预期/动作/实际」后再复现（0.5.0 与 0.4.0 行为可能已不同）。
 - #27 附带的两张截图（`github.com/user-attachments`）本轮未下载细看。
-- lua 默认启用与 custom 平铺两处修复**在上游 libximecore PR #10 中，尚未合并**；本仓 0.5.0 打包出来的 rime.dll 仍**不含 lua**（CI 从 git 依赖现编 librime，`plugins/lua` 不在 librime 的 git 跟踪内）——**0.5.0 发布前须确认 PR #10 已合并并把 rev 再升一次**。
-- 关于页版本号修复已在本仓落地并通过编译，但**关于页显示真实版本号尚未实机确认**（需用户打开设置页「关于」查看）；上游加固 PR #11 同样未合并。
+- lua 默认启用与 custom 平铺两处修复**已在上游 libximecore PR #10 合并**（2026-11-16），本仓 8 个 core 依赖随之升到上游 main `64580b5`，**0.5.0 打包出来的 rime.dll 会带 lua**；但**本机 `D:\project\libximecore` 克隆的 `plugins/lua` 目录需要在构建时联网拉取**（CI 与发布流水线同样需要能访问 github）。
+- 关于页版本号修复已在本仓落地并通过编译，上游加固 PR #11 **已合并**（2026-11-16，本仓 rev 已升到 `64580b5`）；**关于页显示真实版本号尚未实机确认**（需用户打开设置页「关于」查看）。
 - 远程 5 个 issue 的回复与标签已发布（第 7.3 节），**回复后的用户反馈尚未收到**。
 - 升级 rev 后 `Cargo.lock` 里出现**两份 xime-p2p**（本仓直钉 `b19ecde` + libximecore 内部用 `ca07a02`）——2026-11-16 已把本仓统一到 `ca07a02`（`D-016`），进程内只剩一份实例；但**剪贴板 P2P 与设置页配对是否共用同一份身份与端口，仍需两台机器实机验证**（步骤见 `docs/verify/2026-11-10-clipboard-p2p-host.md` 末节）。协议 `PROTOCOL_VERSION` 仍为 1，与旧版本客户端的互通也未验证。
 
@@ -185,4 +185,4 @@ GitHub 的 issue form 是**整份表单一起校验**——任一 body 元素不
 
 - 决策：`D-012`（模板与本地登记）、`D-013`（坏表单静默消失的根因与新增机检）、`D-014`（远程 issue 先本地取证、回复与标签由用户放行）、`D-015`（默认构建启用 lua、方案包 custom 补丁平铺、关于页版本号）、`D-016`（xime-p2p 升到协议 v2，与 libximecore 保持同一份实例）。
 - 未决映射见 `PROGRESS.md` 未决表 U-33 ~ U-37。
-- 上游 PR：`ximeiorg/libximecore#10`（lua 插件 + custom 平铺）、`ximeiorg/libximecore#11`（元数据允许在读到默认值后再注入）。
+- 上游 PR：`ximeiorg/libximecore#10`（lua 插件 + custom 平铺，**已合并**）、`ximeiorg/libximecore#11`（元数据允许在读到默认值后再注入，**已合并**）、`ximeiorg/XimeYao#34`（本仓：关于页版本号修复 + rev 升 `64580b5` + xime-p2p `ca07a02` + docs 首次随代码上上游，**已创建待合并**）。

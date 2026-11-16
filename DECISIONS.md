@@ -6,7 +6,7 @@
 ## D-016 xime-p2p 升到协议 v2，与 libximecore 保持同一份实例
 
 - 日期：2026-11-16
-- 状态：生效（本仓已提交并通过 build/clippy/test）
+- 状态：生效（本仓已提交并通过 build/clippy/test；上游 PR `ximeiorg/XimeYao#34` 已创建待合并）
 - 背景：`D-015` 把 8 个 libximecore 依赖升到上游 main `e813762` 后，锁文件里出现**两份 xime-p2p**：libximecore 内部用 `ca07a02`，本仓直钉 `b19ecdec`。类型不跨界所以编译能过，但剪贴板直连与设置页「设备关联」可能各持一套身份与端口——公告端口的 `SO_REUSEADDR` 改动正是为此，说明多实例共存是需要处理的事实，不是理论风险。
 - 决策：① 本仓 `xime-p2p` 从 `b19ecdec2c0336669897cafe909541906024dc29` 升到 `ca07a02c73edcb56fefb4aaf7eda45d6c720a24f`，与 libximecore 内部一致，进程内只剩一份实例。② `ca07a02` 引入 `Event::Message { topic, payload }`（协议 v2 的通用 topic 消息，帧类型 `MsgType::Message = 0x20`），`handle_p2p_event` 的 `match` 因此不完整（编译报 `E0004`）；Windows 端只用剪贴板通道（`ClipboardSet 0x08`）、没有订阅任何 topic，故新增分支只记 `trace!` 日志不处理，行为不变。③ `Cargo.lock` 在**移走本地 `.cargo/config.toml`** 的状态下用 `cargo update --precise` 重生成，保证 git source 行完整（libximecore 7 处、xime-p2p 2 处，无 `path+file`），CI 可复现。
 - 理由：两份 p2p 实例意味着同一台机器上的剪贴板通道与配对通道可能用不同身份密钥和端口，表现为「一台能连一台连不上」这类难查的问题；统一到一份实例是唯一的根治办法。新增的 `Event::Message` 只记日志不处理，是因为 Windows 端没有订阅方，硬解析一个自己不发的主题只会引入误处理风险。
@@ -17,12 +17,12 @@
 ## D-015 默认构建启用 lua、方案包 custom 补丁平铺到 rime 根目录、关于页版本号修复
 
 - 日期：2026-11-13
-- 状态：生效（本仓改动已落地并通过 build/clippy/test；两处上游加固在 `ximeiorg/libximecore#10` 与 `#11`，待上游合并）
+- 状态：生效（本仓改动已落地并通过 build/clippy/test；两处上游加固 `ximeiorg/libximecore#10` 与 `#11` **已合并**，本仓 rev 已升到 `64580b5`）
 - 背景：本轮由两条外部输入驱动——用户要求「默认构建时需要 lua」，并要求自证「改 `wanxiang.custom.yaml` 后重新部署无效果」是不是 bug；远程 #29 的反馈者补充「改的是 `<rime>\custom\wanxiang.custom.yaml`，客户端 0.4.0 但关于页显示 1.0」。三件事都指向真实缺陷：① librime 的 `plugins/` 目录不在 git 跟踪内，rime-lua 是独立仓，默认构建根本不会带上 lua，本仓内置方案（`wubi86` / `wubi98` / `pinyin_simp` / `wubi86_pinyin` 都引用 `lua_translator@*uuid`）的 lua 功能**一直是静默失效的**；② librime 只在**方案同目录**（rime 根目录）找 `<schema>.custom.yaml`，而方案包把补丁模板放在 `custom/` 子目录，用户改那份自然不生效；③ 关于页版本号显示 1.0，根因是 `xime-config` 的元数据用 `OnceLock`，被日志初始化提前读走默认值后再也覆盖不了。
 - 决策：① 上游 `crates/librime-sys2/build.rs` 增加 `ensure_lua_plugin()`——构建前探测 `<librime>/plugins/lua/CMakeLists.txt` 与 `<librime>/plugins/lua/thirdparty/lua5.4/lua.h`，缺失则 `git clone --depth 1` 拉 `hchunhui/librime-lua`，再 `git clone --depth 1 --branch thirdparty` 拉 lua 源码；**失败时删掉半个插件目录**，宁可退回「没有 lua」也不让 CMake 的 `FATAL_ERROR "Lua not found"` 打断整个构建。② 上游 `crates/xime-setup/src/state.rs` 增加 `flatten_schema_custom_templates()`——安装释放后把**本包自带方案**的 `custom/<schema>.custom.yaml` 平铺到 rime 根目录，根目录已有同名文件则不覆盖（保护用户已改内容），`custom/` 下副本保留（万象的 lua 把它当模板来源）。③ 本仓 `crates/winxime-setup/src/main.rs` 把 `set_app_metadata(...)` 移到 `init_logging_with_console("setup")` 之前；上游 `xime-config` 另把元数据持有者从 `OnceLock` 换成 `MetadataCell`，允许「读到默认值之后再注入一次」。④ 本仓 8 个 libximecore 依赖 rev 由 `04d6ca9` 升到上游 main `e813762`（含方案包 id 归一化、aes-gcm 弃用、clipboard-page 门控三项已合并修复）。⑤ 两个缺陷各自写回归测试：custom 平铺两个用例、 元数据注入两个用例。
 - 理由：lua 与 custom 平铺都必须在**上游 libximecore** 修——librime 是上游 core 的子模块、方案包安装逻辑在 `xime-setup` crate，本仓只有宿主壳子，改本仓等于打补丁掩盖根因；而上游 core 的 `plugins/` 不跟踪第三方插件，只能由构建脚本负责拉取（librime 自带的 `action-install-plugins-windows.bat` 需要人先设 `RIME_PLUGINS` 环境变量，CI 与发布流水线不会设）。关于页那条优先改本仓顺序，因为本仓立刻能生效且成本最低，上游加固是防同类顺序问题再犯。关于页与 lua 两处都属「用户看得见的功能静默失效」，比崩溃更隐蔽，所以宁可多写一段构建期探测，也要保证默认构建出来的 rime.dll 带 lua。
 - 影响与代价：构建期多一次 git clone（首次约几十 MB，拉不满时退回无 lua 并打 `cargo:warning`）；CI 与本机打包流程因此依赖能访问 github；方案包安装后 rime 根目录会多出 `<schema>.custom.yaml`，这是**新增文件**，用户若手动删掉再「重新部署」，安装器不会自动补回（只有重装方案包才会平铺）。本仓依赖 rev 上移带入 core 的行为变更（方案包 id 归一化会改变市场页显示的 id），需要实机复核一次。
-- 遗留：上游 PR #10（lua + custom 平铺）与 #11（元数据允许后注入）均**待上游合并**——本仓账号对 `ximeiorg/libximecore` 只有 PR 权限，合并须上游成员操作；**0.5.0 发布前必须确认 PR #10 已合并并把 rev 再升一次**，否则发布出去的 rime.dll 仍不带 lua，#29 的 `/zrm` 依旧不可用。关于页版本号改动尚未实机确认（需用户打开设置页「关于」查看）。U-33 / U-35 的实机复现仍未做。
+- 遗留：上游 PR #10（lua + custom 平铺）与 #11（元数据允许后注入）**已于 2026-11-16 合并**，本仓 8 个 core 依赖 rev 已升到上游 main `64580b5`，0.5.0 发布包会带 lua，#29 的 `/zrm` 应当可用——**待用户实机复测确认**。关于页版本号改动尚未实机确认（需用户打开设置页「关于」查看）。U-33 / U-35 的实机复现仍未做。
 - 验证方式：本仓 `cargo +nightly-2026-07-03 build --quiet` exit 0、`clippy --workspace --all-targets` 0 warning、`test --workspace` 192 passed / 0 failed / 1 ignored；上游 `cargo +1.95 test -p xime-setup-lib` 50 passed（含两个 custom 平铺用例）、`cargo +1.95 test -p xime-config metadata` 4 passed（含两个元数据注入用例）、`clippy -p xime-config --all-targets` 无本次引入的新告警。证据见 `docs/verify/2026-11-13-issue-templates-and-remote-issues.md` 第 7 节。
 
 ## D-014 远程 issue 先本地取证，回复与标签由用户放行
