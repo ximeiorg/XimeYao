@@ -9,23 +9,24 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["Kor1 <kingzcheung@gmail.com>"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/ximeiorg/XimeYao"
 
 [workspace.dependencies]
-# libximecore — git dep，钉到包含 xime-speech ModelChecksum 与词典回调 Result 的合并提交；
-# 本地开发时由 .cargo/config.toml 的 [patch] 覆盖为固定到同一提交的本地克隆。
-librime = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "librime" }
-librime-sys2 = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "librime-sys2" }
-xime-config = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-config" }
-xime-rime = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-rime" }
-xime-ipc = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-ipc" }
-xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-setup-lib" }
-xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-plugin" }
-xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", rev = "64580b580e453a288c7fec053e0849ed05c3282e", package = "xime-speech" }
+# libximecore — git dep，跟随上游 main（不钉 rev；实际构建版本由 Cargo.lock 冻结，
+# 要跟新上游就 `cargo update -p xime-config` 等重新生成锁）。
+# 本地开发时由 .cargo/config.toml 的 [patch] 覆盖为本地克隆。
+librime = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "librime" }
+librime-sys2 = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "librime-sys2" }
+xime-config = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "xime-config" }
+xime-rime = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "xime-rime" }
+xime-ipc = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "xime-ipc" }
+xime-setup-lib = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "xime-setup-lib" }
+xime-plugin = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "xime-plugin" }
+xime-speech = { git = "https://github.com/ximeiorg/libximecore.git", branch = "main", package = "xime-speech" }
 
 # libximep2p — 局域网直连传输层（剪贴板同步用），rev 与 xime-setup 的 pair-page 一致。
 xime-p2p = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "ca07a02c73edcb56fefb4aaf7eda45d6c720a24f" }
